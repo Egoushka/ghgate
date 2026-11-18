@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 )
 
@@ -18,11 +19,13 @@ type Client struct {
 
 type App struct {
 	ID      int64  `json:"id"`
-	KeyFile string `json:"key_file"`
+	KeyFile string `json:"key_file,omitempty"`
+	KeyEnv  string `json:"key_env,omitempty"`
 }
 
 type Cred struct {
 	PatFile string `json:"pat_file,omitempty"`
+	PatEnv  string `json:"pat_env,omitempty"`
 	App     *App   `json:"app,omitempty"`
 }
 
@@ -110,11 +113,8 @@ func (c *Config) Normalize() error {
 		c.Read = c.Write
 	}
 	for _, cr := range []*Cred{c.Read, c.Write} {
-		if (cr.PatFile == "") == (cr.App == nil) {
-			return errors.New("config: a credential needs exactly one of pat_file or app")
-		}
-		if cr.App != nil && (cr.App.ID == 0 || cr.App.KeyFile == "") {
-			return errors.New("config: app needs id and key_file")
+		if err := cr.validate(); err != nil {
+			return err
 		}
 	}
 	if len(c.Clients) == 0 {
@@ -125,6 +125,36 @@ func (c *Config) Normalize() error {
 		if cl.Name == "" || err != nil || len(b) != 32 {
 			return fmt.Errorf("config: client %q needs a name and a 64-hex token_sha256", cl.Name)
 		}
+	}
+	return nil
+}
+
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+func (cr *Cred) validate() error {
+	n := 0
+	for _, set := range []bool{cr.PatFile != "", cr.PatEnv != "", cr.App != nil} {
+		if set {
+			n++
+		}
+	}
+	if n != 1 {
+		return errors.New("config: a credential needs exactly one of pat_file, pat_env or app")
+	}
+	if cr.PatEnv != "" && !envName.MatchString(cr.PatEnv) {
+		return errors.New("config: pat_env must be an environment variable name")
+	}
+	if cr.App == nil {
+		return nil
+	}
+	if cr.App.ID == 0 {
+		return errors.New("config: app needs id")
+	}
+	if (cr.App.KeyFile == "") == (cr.App.KeyEnv == "") {
+		return errors.New("config: app needs exactly one of key_file or key_env")
+	}
+	if cr.App.KeyEnv != "" && !envName.MatchString(cr.App.KeyEnv) {
+		return errors.New("config: key_env must be an environment variable name")
 	}
 	return nil
 }

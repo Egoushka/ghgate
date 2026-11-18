@@ -4,6 +4,7 @@ package creds
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -50,4 +51,22 @@ func (p *PAT) Token(_ context.Context, _ string) (string, string, error) {
 		p.tok, p.mtime, p.size = tok, fi.ModTime(), fi.Size()
 	}
 	return p.tok, "pat:" + p.path, nil
+}
+
+// StaticPAT is a token read once, from the environment, at start.
+type StaticPAT struct {
+	tok, label string
+}
+
+// NewPATFromEnv reads the token from the variable name. Errors never include the value.
+func NewPATFromEnv(name string) (*StaticPAT, error) {
+	tok := strings.TrimSpace(os.Getenv(name))
+	if tok == "" {
+		return nil, fmt.Errorf("creds: environment variable %s is empty or unset", name)
+	}
+	return &StaticPAT{tok: tok, label: "pat:env:" + name}, nil
+}
+
+func (p *StaticPAT) Token(_ context.Context, _ string) (string, string, error) {
+	return p.tok, p.label, nil
 }

@@ -228,12 +228,21 @@ func (a *App) loadKey() (*rsa.PrivateKey, error) {
 	if err != nil {
 		return nil, errors.New("creds: cannot read app key file")
 	}
+	k, err := ParseKey(b)
+	if err != nil {
+		return nil, err
+	}
+	a.key = k
+	return k, nil
+}
+
+// ParseKey parses an RSA private key in PEM form (PKCS#1 or PKCS#8).
+func ParseKey(b []byte) (*rsa.PrivateKey, error) {
 	blk, _ := pem.Decode(b)
 	if blk == nil {
-		return nil, errors.New("creds: app key file is not PEM")
+		return nil, errors.New("creds: app key is not PEM")
 	}
 	if k, err := x509.ParsePKCS1PrivateKey(blk.Bytes); err == nil {
-		a.key = k
 		return k, nil
 	}
 	k8, err := x509.ParsePKCS8PrivateKey(blk.Bytes)
@@ -244,8 +253,35 @@ func (a *App) loadKey() (*rsa.PrivateKey, error) {
 	if !ok {
 		return nil, errors.New("creds: app key is not RSA")
 	}
-	a.key = k
 	return k, nil
+}
+
+// KeyFromEnv reads an App key from the environment variable name. The value is
+// PEM text or the base64 of the PEM. Errors name the variable, never its value.
+func KeyFromEnv(name string) (*rsa.PrivateKey, error) {
+	v := strings.TrimSpace(os.Getenv(name))
+	if v == "" {
+		return nil, fmt.Errorf("creds: environment variable %s is empty or unset", name)
+	}
+	if !strings.Contains(v, "-----BEGIN") {
+		dec, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			return nil, fmt.Errorf("creds: %s is neither PEM nor base64", name)
+		}
+		v = string(dec)
+	}
+	k, err := ParseKey([]byte(v))
+	if err != nil {
+		return nil, fmt.Errorf("%s (from %s)", err.Error(), name)
+	}
+	return k, nil
+}
+
+// NewAppWithKey is NewApp for a key already in memory.
+func NewAppWithKey(id int64, key *rsa.PrivateKey, apiBase string, hc *http.Client) *App {
+	a := NewApp(id, "", apiBase, hc)
+	a.key = key
+	return a
 }
 
 // jwt signs an RS256 app JWT, valid for 9 minutes.

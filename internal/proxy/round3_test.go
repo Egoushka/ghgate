@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -129,6 +130,73 @@ func TestBlockedIPsEmbeddingIPv4(t *testing.T) {
 	for _, ip := range []string{"64:ff9b::808:808", "2002:808:808::1", "::8.8.8.8"} {
 		if blockedIP(net.ParseIP(ip)) {
 			t.Errorf("%s embeds a public IPv4 address and must be allowed", ip)
+		}
+	}
+}
+
+func TestEnvCredentialsAreUsedUpstreamAndSameByName(t *testing.T) {
+	t.Setenv("GHG_READ", "ghp_ENV_READ_token")
+	t.Setenv("GHG_WRITE", "ghp_ENV_WRITE_token")
+	h := newHarness(t, func(c *config.Config) {
+		c.Read = &config.Cred{PatEnv: "GHG_READ"}
+		c.Write = &config.Cred{PatEnv: "GHG_WRITE"}
+	})
+	h.get(clientRead, "/repos/o/r")
+	if lastAuth(h) != "Bearer ghp_ENV_READ_token" {
+		t.Fatalf("read auth %q", lastAuth(h))
+	}
+	if h.srv.sameCred {
+		t.Fatal("two env vars are two credentials")
+	}
+	if credID(&config.Cred{PatEnv: "A"}) != credID(&config.Cred{PatEnv: "A"}) ||
+		credID(&config.Cred{PatEnv: "A"}) == credID(&config.Cred{PatEnv: "B"}) ||
+		credID(&config.Cred{PatEnv: "A"}) == credID(&config.Cred{PatFile: "A"}) {
+		t.Fatal("env credentials are the same exactly when the variable matches")
+	}
+	t.Setenv("GHG_SAME", "ghp_same")
+	h2 := newHarness(t, func(c *config.Config) {
+		c.Read = &config.Cred{PatEnv: "GHG_SAME"}
+		c.Write = &config.Cred{PatEnv: "GHG_SAME"}
+	})
+	if !h2.srv.sameCred {
+		t.Fatal("the same env var is the same credential")
+	}
+}
+
+func TestMissingEnvCredentialFailsAtStart(t *testing.T) {
+	cfg := &config.Config{
+		StateDir: filepath.Join(t.TempDir(), "state"),
+		Clients:  []config.Client{{Name: "a", TokenSHA256: hashOf(t, "x")}},
+		Write:    &config.Cred{PatEnv: "GHG_DEFINITELY_UNSET"},
+	}
+	if err := cfg.Normalize(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cfg, Options{}); err == nil || !strings.Contains(err.Error(), "GHG_DEFINITELY_UNSET") {
+		t.Fatalf("want a start error naming the variable, got %v", err)
+	}
+}
+
+func TestAdminServesCABundleWithoutKeys(t *testing.T) {
+	h := newHarness(t, nil)
+	srv := httptest.NewServer(h.srv.AdminHandler())
+	defer srv.Close()
+	resp, err := http.Get(srv.URL + "/ca.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != 200 || resp.Header.Get("Content-Type") != "application/x-pem-file" {
+		t.Fatalf("status %d type %q", resp.StatusCode, resp.Header.Get("Content-Type"))
+	}
+	if string(b) != string(h.srv.CA().CertPEM()) || !strings.Contains(string(b), "BEGIN CERTIFICATE") || strings.Contains(string(b), "PRIVATE KEY") {
+		t.Fatal("bundle must equal the public CA certificates")
+	}
+	if r, _ := http.Post(srv.URL+"/ca.pem", "text/plain", nil); r != nil {
+		r.Body.Close()
+		if r.StatusCode == 200 {
+			t.Fatal("POST must not be served")
 		}
 	}
 }

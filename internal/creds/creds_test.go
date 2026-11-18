@@ -226,3 +226,78 @@ func TestAppWithoutOwnerHasNoInstallation(t *testing.T) {
 		t.Fatalf("an empty owner must not pick an installation: %v", err)
 	}
 }
+
+func testKeyPEM(t *testing.T) (*rsa.PrivateKey, []byte) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
+}
+
+func TestKeyFromEnvAcceptsPEMAndBase64(t *testing.T) {
+	key, p := testKeyPEM(t)
+	t.Setenv("K_PEM", string(p))
+	t.Setenv("K_B64", base64.StdEncoding.EncodeToString(p))
+	t.Setenv("K_B64_NL", base64.StdEncoding.EncodeToString(p)+"\n")
+	for _, n := range []string{"K_PEM", "K_B64", "K_B64_NL"} {
+		k, err := KeyFromEnv(n)
+		if err != nil {
+			t.Fatalf("%s: %v", n, err)
+		}
+		if !k.Equal(key) {
+			t.Fatalf("%s: wrong key", n)
+		}
+	}
+}
+
+func TestKeyFromEnvErrorsNeverCarryTheValue(t *testing.T) {
+	const secret = "SUPERSECRETVALUE"
+	t.Setenv("K_BAD", secret+"!!")
+	t.Setenv("K_NOTPEM", base64.StdEncoding.EncodeToString([]byte(secret)))
+	t.Setenv("K_EMPTY", "  ")
+	for _, n := range []string{"K_BAD", "K_NOTPEM", "K_EMPTY", "K_UNSET"} {
+		_, err := KeyFromEnv(n)
+		if err == nil {
+			t.Fatalf("%s: want an error", n)
+		}
+		if strings.Contains(err.Error(), secret) || !strings.Contains(err.Error(), n) {
+			t.Fatalf("%s: error %q", n, err)
+		}
+	}
+}
+
+func TestAppWithEnvKeySignsAndPATFromEnvIsReadOnce(t *testing.T) {
+	key, p := testKeyPEM(t)
+	t.Setenv("K_PEM", string(p))
+	k, err := KeyFromEnv("K_PEM")
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := NewAppWithKey(5, k, "https://127.0.0.1:1", http.DefaultClient)
+	j, err := a.jwt()
+	if err != nil {
+		t.Fatal(err)
+	}
+	parts := strings.Split(j, ".")
+	sig, _ := base64.RawURLEncoding.DecodeString(parts[2])
+	h := sha256.Sum256([]byte(parts[0] + "." + parts[1]))
+	if err := rsa.VerifyPKCS1v15(&key.PublicKey, crypto.SHA256, h[:], sig); err != nil {
+		t.Fatal("jwt not signed by the env key:", err)
+	}
+
+	t.Setenv("GH_PAT_T", " ghp_env_token \n")
+	pat, err := NewPATFromEnv("GH_PAT_T")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("GH_PAT_T", "changed")
+	tok, label, err := pat.Token(context.Background(), "o")
+	if err != nil || tok != "ghp_env_token" || strings.Contains(label, tok) {
+		t.Fatalf("tok=%q label=%q err=%v", tok, label, err)
+	}
+	if _, err := NewPATFromEnv("GH_PAT_UNSET"); err == nil || !strings.Contains(err.Error(), "GH_PAT_UNSET") {
+		t.Fatalf("unset PAT env: %v", err)
+	}
+}

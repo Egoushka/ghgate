@@ -129,18 +129,29 @@ func New(cfg *config.Config, opt Options) (*Server, error) {
 			s.intercept[h] = target{"https://" + h, strings.HasPrefix(h, "api.")}
 		}
 	}
-	mk := func(c *config.Cred) creds.Source {
-		if c.PatFile != "" {
-			return creds.NewPAT(c.PatFile)
+	mk := func(c *config.Cred) (creds.Source, error) {
+		switch {
+		case c.PatFile != "":
+			return creds.NewPAT(c.PatFile), nil
+		case c.PatEnv != "":
+			return creds.NewPATFromEnv(c.PatEnv)
+		case c.App.KeyEnv != "":
+			k, err := creds.KeyFromEnv(c.App.KeyEnv)
+			if err != nil {
+				return nil, err
+			}
+			return creds.NewAppWithKey(c.App.ID, k, apiBase, hc), nil
 		}
-		return creds.NewApp(c.App.ID, c.App.KeyFile, apiBase, hc)
+		return creds.NewApp(c.App.ID, c.App.KeyFile, apiBase, hc), nil
 	}
-	s.write = mk(cfg.Write)
+	if s.write, err = mk(cfg.Write); err != nil {
+		return nil, err
+	}
 	s.sameCred = credID(cfg.Read) == credID(cfg.Write)
 	if s.sameCred {
 		s.read = s.write
-	} else {
-		s.read = mk(cfg.Read)
+	} else if s.read, err = mk(cfg.Read); err != nil {
+		return nil, err
 	}
 	for _, c := range cfg.Clients {
 		b, _ := hex.DecodeString(c.TokenSHA256)
@@ -155,6 +166,9 @@ func New(cfg *config.Config, opt Options) (*Server, error) {
 func credID(c *config.Cred) string {
 	if c.App != nil {
 		return "app:" + strconv.FormatInt(c.App.ID, 10)
+	}
+	if c.PatEnv != "" {
+		return "patenv:" + c.PatEnv
 	}
 	p, err := filepath.Abs(c.PatFile)
 	if err != nil {
@@ -384,6 +398,10 @@ func (s *Server) authenticateValue(v string) (*client, bool) {
 func (s *Server) AdminHandler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) { fmt.Fprintln(w, "ok") })
+	mux.HandleFunc("GET /ca.pem", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/x-pem-file")
+		w.Write(s.ca.CertPEM())
+	})
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		entries, bytes := s.cache.Stats()
