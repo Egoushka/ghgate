@@ -21,7 +21,10 @@ import (
 	"time"
 )
 
-const renewBefore = 10 * time.Minute
+const (
+	renewBefore = 10 * time.Minute
+	loadBackoff = 60 * time.Second
+)
 
 type installation struct {
 	id    int64
@@ -46,6 +49,8 @@ type App struct {
 	key      *rsa.PrivateKey
 	installs []installation
 	loadedAt time.Time
+	failedAt time.Time // last failed installation load; retried only after loadBackoff
+	loadErr  error
 	toks     map[string]cachedTok
 }
 
@@ -119,11 +124,19 @@ func (a *App) mint(ctx context.Context, owner string) (string, string, error) {
 }
 
 // findInstallation looks the owner up, reloading the installation list at most
-// once a minute. An empty owner picks the lowest installation id.
+// once a minute, and not at all for 60 s after a failed load.
 func (a *App) findInstallation(ctx context.Context, owner string) (installation, error) {
+	if owner == "" {
+		return installation{}, ErrNoInstallation // no owner, no installation: callers use default_owner or another credential
+	}
 	a.mu.Lock()
 	loaded, age := a.installs != nil, a.now().Sub(a.loadedAt)
 	i := a.find(owner)
+	if (!loaded || i == nil) && a.loadErr != nil && a.now().Sub(a.failedAt) < loadBackoff {
+		err := a.loadErr
+		a.mu.Unlock()
+		return installation{}, err
+	}
 	a.mu.Unlock()
 	if !loaded || (i == nil && age > time.Minute) {
 		v, _ := a.flights.Do("installs", func() any { return a.loadInstallations(ctx) })
@@ -141,9 +154,15 @@ func (a *App) findInstallation(ctx context.Context, owner string) (installation,
 }
 
 func (a *App) loadInstallations(ctx context.Context) any {
+	fail := func(err error) any {
+		a.mu.Lock()
+		a.loadErr, a.failedAt = err, a.now()
+		a.mu.Unlock()
+		return err
+	}
 	jwt, err := a.jwt()
 	if err != nil {
-		return err
+		return fail(err)
 	}
 	all := []installation{}
 	for page := 1; page <= 20; page++ {
@@ -154,7 +173,7 @@ func (a *App) loadInstallations(ctx context.Context) any {
 			} `json:"account"`
 		}
 		if err := a.call(ctx, http.MethodGet, fmt.Sprintf("/app/installations?per_page=100&page=%d", page), jwt, &out); err != nil {
-			return err
+			return fail(err)
 		}
 		for _, o := range out {
 			all = append(all, installation{o.ID, o.Account.Login})
@@ -165,7 +184,7 @@ func (a *App) loadInstallations(ctx context.Context) any {
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
 	a.mu.Lock()
-	a.installs, a.loadedAt = all, a.now()
+	a.installs, a.loadedAt, a.loadErr = all, a.now(), nil
 	a.mu.Unlock()
 	return nil
 }
@@ -173,7 +192,7 @@ func (a *App) loadInstallations(ctx context.Context) any {
 // find must be called with a.mu held.
 func (a *App) find(owner string) *installation {
 	for i := range a.installs {
-		if owner == "" || strings.EqualFold(a.installs[i].login, owner) {
+		if owner != "" && strings.EqualFold(a.installs[i].login, owner) {
 			return &a.installs[i]
 		}
 	}

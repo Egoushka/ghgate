@@ -92,7 +92,7 @@ func printCA(args []string) error {
 	if err != nil {
 		return err
 	}
-	c, err := ca.LoadOrCreate(cfg.StateDir, cfg.InterceptHosts)
+	c, err := ca.LoadOrCreateSet(cfg.StateDir, cfg.InterceptHosts)
 	if err != nil {
 		return err
 	}

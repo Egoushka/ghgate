@@ -1,69 +1,128 @@
 package ca
 
 import (
+	"crypto/tls"
 	"crypto/x509"
+	"encoding/pem"
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
 
-func TestAC9_LeafVerifiesAndNameConstraintsHold(t *testing.T) {
+func newSet(t *testing.T) (*Set, string) {
 	dir := filepath.Join(t.TempDir(), "state")
-	c, err := LoadOrCreate(dir, []string{"api.github.com", "github.com"})
+	set, err := LoadOrCreateSet(dir, []string{"api.github.com", "github.com"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fi, _ := os.Stat(filepath.Join(dir, keyFile)); fi.Mode().Perm() != 0o600 {
-		t.Fatalf("key mode %v", fi.Mode().Perm())
+	return set, dir
+}
+
+func verifies(c *CA, l *tls.Certificate, name string) error {
+	_, err := l.Leaf.Verify(x509.VerifyOptions{Roots: c.Pool(), DNSName: name})
+	return err
+}
+
+func TestAC9_LeafVerifiesAndNameConstraintsHold(t *testing.T) {
+	set, dir := newSet(t)
+	for _, h := range []string{"api.github.com", "github.com"} {
+		c := set.cas[h]
+		if fi, _ := os.Stat(filepath.Join(dir, "ca", h, keyFile)); fi.Mode().Perm() != 0o600 {
+			t.Fatalf("%s key mode %v", h, fi.Mode().Perm())
+		}
+		if !c.cert.PermittedDNSDomainsCritical || len(c.cert.PermittedDNSDomains) != 1 || c.cert.PermittedDNSDomains[0] != h {
+			t.Fatalf("%s: name constraints wrong: %v", h, c.cert.PermittedDNSDomains)
+		}
+		good, _ := c.Leaf(h)
+		if err := verifies(c, good, h); err != nil {
+			t.Fatalf("%s leaf must verify: %v", h, err)
+		}
 	}
-	if !c.cert.PermittedDNSDomainsCritical || len(c.cert.PermittedDNSDomains) != 2 {
-		t.Fatal("name constraints missing or not critical")
+	gh := set.cas["github.com"]
+	for _, name := range []string{"example.com", "evil.github.com", "api.github.com", "a.b.github.com", "notgithub.com"} {
+		l, _ := gh.Leaf(name)
+		if err := verifies(gh, l, name); err == nil {
+			t.Errorf("a leaf for %s from the github.com CA must fail verification", name)
+		}
 	}
-	good, err := c.Leaf("api.github.com")
-	if err != nil {
+	api := set.cas["api.github.com"]
+	if l, _ := api.Leaf("github.com"); verifies(api, l, "github.com") == nil {
+		t.Error("the api.github.com CA must not sign github.com")
+	}
+	if l, _ := api.Leaf("x.api.github.com"); verifies(api, l, "x.api.github.com") == nil {
+		t.Error("the api.github.com CA must not sign its subdomains")
+	}
+	// The bundle verifies each host and still rejects forgeries.
+	l, _ := set.Leaf("github.com")
+	if _, err := l.Leaf.Verify(x509.VerifyOptions{Roots: set.Pool(), DNSName: "github.com"}); err != nil {
 		t.Fatal(err)
 	}
-	opts := x509.VerifyOptions{Roots: c.Pool(), DNSName: "api.github.com"}
-	if _, err := good.Leaf.Verify(opts); err != nil {
-		t.Fatalf("api.github.com leaf must verify: %v", err)
+	if strings.Count(string(set.CertPEM()), "BEGIN CERTIFICATE") != 2 {
+		t.Fatal("ghgate ca must print every CA certificate")
 	}
-	bad, err := c.Leaf("example.com")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := bad.Leaf.Verify(x509.VerifyOptions{Roots: c.Pool(), DNSName: "example.com"}); err == nil {
-		t.Fatal("a leaf for example.com must fail verification")
-	}
-	// The known limit: a DNS constraint covers subdomains, so a leaked key can forge *.github.com.
-	sub, _ := c.Leaf("evil.github.com")
-	if _, err := sub.Leaf.Verify(x509.VerifyOptions{Roots: c.Pool(), DNSName: "evil.github.com"}); err != nil {
-		t.Fatalf("documented limit changed: evil.github.com is expected to verify: %v", err)
-	}
-	// IP and email names are excluded outright, even next to a permitted DNS name.
+	// IP, email and URI names are excluded outright, even next to a permitted DNS name.
 	for name, tweak := range map[string]func(*x509.Certificate){
 		"ip":    func(t *x509.Certificate) { t.IPAddresses = []net.IP{net.ParseIP("203.0.113.9")} },
 		"ip6":   func(t *x509.Certificate) { t.IPAddresses = []net.IP{net.ParseIP("2001:db8::1")} },
 		"email": func(t *x509.Certificate) { t.EmailAddresses = []string{"a@github.com"} },
 		"uri":   func(t *x509.Certificate) { t.URIs = []*url.URL{{Scheme: "https", Host: "github.com"}} },
 	} {
-		l, err := c.leaf("api.github.com", tweak)
+		l, err := gh.leaf("github.com", tweak)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, err := l.Leaf.Verify(x509.VerifyOptions{Roots: c.Pool(), DNSName: "api.github.com"}); err == nil {
+		if verifies(gh, l, "github.com") == nil {
 			t.Errorf("a leaf with an extra %s name must fail verification", name)
 		}
 	}
-	// reload keeps the same CA; changed hosts are refused
-	c2, err := LoadOrCreate(dir, []string{"github.com", "api.github.com"})
-	if err != nil || string(c2.CertPEM()) != string(c.CertPEM()) {
+	if _, err := set.Leaf("example.com"); err == nil {
+		t.Fatal("Set must not issue for a host it does not intercept")
+	}
+	// reload keeps the same CAs; a changed host list adds a CA
+	set2, err := LoadOrCreateSet(dir, []string{"github.com", "api.github.com"})
+	if err != nil || string(set2.cas["github.com"].certPEM) != string(gh.certPEM) {
 		t.Fatalf("reload: %v", err)
 	}
-	if _, err := LoadOrCreate(dir, []string{"github.com"}); err == nil {
-		t.Fatal("changed intercept hosts must be refused")
+}
+
+func TestOldSingleCALayoutIsRefused(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	os.MkdirAll(dir, 0o700)
+	os.WriteFile(filepath.Join(dir, "ca.pem"), []byte("old"), 0o644)
+	_, err := LoadOrCreateSet(dir, []string{"github.com"})
+	if err == nil || !strings.Contains(err.Error(), "old single-CA layout") {
+		t.Fatalf("want a clear refusal, got %v", err)
+	}
+}
+
+// OpenSSL must honour the constraints too, not only Go.
+func TestOpenSSLHonoursPerHostConstraints(t *testing.T) {
+	ossl, err := exec.LookPath("openssl")
+	if err != nil {
+		t.Skip("openssl not installed")
+	}
+	set, _ := newSet(t)
+	tmp := t.TempDir()
+	bundle := filepath.Join(tmp, "bundle.pem")
+	os.WriteFile(bundle, set.CertPEM(), 0o644)
+	gh := set.cas["github.com"]
+	for _, c := range []struct {
+		host string
+		ok   bool
+	}{{"github.com", true}, {"evil.github.com", false}, {"example.com", false}} {
+		l, _ := gh.Leaf(c.host)
+		f := filepath.Join(tmp, c.host+".pem")
+		os.WriteFile(f, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: l.Certificate[0]}), 0o644)
+		out, err := exec.Command(ossl, "verify", "-CAfile", bundle, f).CombinedOutput()
+		if (err == nil) != c.ok {
+			t.Errorf("openssl verify %s: ok=%v want %v: %s", c.host, err == nil, c.ok, out)
+		}
+		t.Logf("openssl %s: %s", c.host, strings.TrimSpace(string(out)))
 	}
 }
 

@@ -4,6 +4,7 @@
   "state_dir": "state",
   "intercept_hosts": ["api.github.com", "github.com"],
   "tunnel_others": false,
+  "default_owner": "my-org",
   "clients": [
     {"name": "agent-readonly", "token_sha256": "<output of: printf %s TOKEN | ghgate hash-token>", "can_write": false},
     {"name": "agent-writer", "token_sha256": "<another sha256>", "can_write": true}

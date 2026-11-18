@@ -33,9 +33,10 @@ cached answer makes a waiting tool such as `ws wait` decide wrongly.
 **Listener.** `ghgate serve --config ghgate.json` runs an HTTP proxy that accepts `CONNECT`.
 - **Intercepted hosts:** `api.github.com` and `github.com`, configurable. ghgate terminates TLS for them with a leaf certificate signed by its own CA.
 - **The CA:**
-  - It is generated on first start (ECDSA P-256) into the state directory, with the key at mode 0600.
-  - Its **x509 name constraints** permit only the intercepted hosts, so a leaked CA key cannot forge other sites.
-  - `ghgate ca` prints the PEM of the CA certificate.
+  - There is **one CA per intercepted host**, generated on first start (ECDSA P-256) into `state_dir/ca/<host>/`, with the key at mode 0600.
+  - Each CA's **x509 name constraints** permit only its exact host (for `github.com`: permitted `github.com`, excluded `.github.com`) and exclude all IP, email and URI names. A leaked key therefore forges one host and nothing else, not even its subdomains.
+  - A CA left over from the old single-CA layout (`state_dir/ca.pem`) is refused at start-up with a message.
+  - `ghgate ca` prints the bundle of all CA certificates.
 - **Every other host** is tunnelled byte for byte, without interception, only when `tunnel_others` is true (default false). Tunnels refuse loopback, private, link-local, ULA, CGNAT, unspecified and multicast destinations (checked on the resolved address) and the admin listener, and close after 5 min idle.
 - **`CONNECT` needs the client token** as `Proxy-Authorization` (Basic with the token as the password, or Bearer); without it the answer is `407`.
 - **Admin listener.** A second listener, on loopback by default, serves `GET /stats` and `GET /healthz`.
@@ -53,7 +54,9 @@ Rules:
 - `{"pat_file": path}`. The file is re-read when its mtime changes, so a rotation needs no restart.
 - `{"app": {"id": N, "key_file": path}}`. ghgate mints an installation token for each owner, finding the installation through `GET /app/installations`, and renews it 10 min before it expires.
 
-When `read` is omitted, it falls back to `write`; every GraphQL POST then needs `can_write`, because it runs with the write credential.
+When `read` is omitted, it falls back to `write`; every GraphQL POST then needs `can_write`, because it runs with the write credential. Two entries are one credential when they name the same `pat_file` (after resolving symlinks) or the same App id.
+
+**App mode and the owner.** A request names an owner in the path (`/repos/o/...`, `/orgs/o`, `/users/o`). One without (GraphQL, `/user`, `/repositories/N`) uses the installation of `default_owner` when that is set. Otherwise it is read with the `write` credential: plain `GET`s as for any client, GraphQL only for clients with `can_write`. There is no "first installation" guess. GraphQL answers a repository the installation cannot see with `200` and partial data, so the 404/403 retry does not cover it. A failed `/app/installations` load is not retried for 60 s.
 
 **Routing.**
 
@@ -62,7 +65,7 @@ When `read` is omitted, it falls back to `write`; every GraphQL POST then needs 
 | `GET`/`HEAD` on the API | read; if read answers 404 or 403 (not a rate-limit 403), retried once with write, for a client with `can_write` only and while the bucket is above `floor` (the App may not be installed on that repo) | yes |
 | `POST /graphql` whose body is exactly one object with the keys `query`, `variables`, `operationName` and a document with only queries (a batch, a duplicate or unknown key, or anything unparseable is a write) | read (with the same 404/403 retry) | no; identical concurrent bodies are coalesced |
 | `POST /graphql` with a mutation, and any other method on the API | write. `403` when the client lacks `can_write` | no; it invalidates cached entries under the `/repos/{owner}/{repo}` it touched |
-| `github.com` (git smart HTTP, web) | write, as Basic `x-access-token:<token>`. Only `GET /{o}/{r}[.git]/info/refs?service=git-upload-pack` and `POST /{o}/{r}[.git]/git-upload-pack` are open to read-only clients; everything else needs `can_write` | no, streamed |
+| `github.com` (git smart HTTP, web) | write, as Basic `x-access-token:<token>`. A client without `can_write` gets git upload-pack only: no LFS batch, no archive or raw `GET`s, no web pages. Only `GET /{o}/{r}[.git]/info/refs?service=git-upload-pack` and `POST /{o}/{r}[.git]/git-upload-pack` are open to read-only clients; everything else needs `can_write` | no, streamed |
 
 **Cache.**
 - **Key:** credential kind (`read` or `write`), method, full URL, and the `Accept` and `X-GitHub-Api-Version` headers.
@@ -96,7 +99,7 @@ When `read` is omitted, it falls back to `write`; every GraphQL POST then needs 
 | AC6 | Below the floor, a read gets 429 with `Retry-After`, with 0 upstream requests. A write still passes. |
 | AC7 | A read answered 404 by the read credential is retried once with the write credential, for a client with `can_write`. A client without it gets the 404. |
 | AC8 | CONNECT to a host that is not intercepted is tunnelled: the client sees the origin's own certificate. |
-| AC9 | A leaf certificate for `api.github.com` verifies against the CA, and a leaf ghgate is made to sign for `example.com` fails verification (name constraints). |
+| AC9 | A leaf certificate for `api.github.com` verifies against its CA. Leaves that ghgate is made to sign for `example.com`, for `evil.github.com` (from the `github.com` CA), or with an IP, email or URI name fail verification (name constraints), in Go and in OpenSSL. |
 | AC10 | Captured logs contain no client or upstream token substring. |
 | AC11 | App mode: against a fake `/app/installations` and `/access_tokens`, ghgate mints a token per owner, uses it for that owner's reads and renews it before expiry. |
 | AC12 | A PAT file rewritten on disk is used on the next request, without a restart. |

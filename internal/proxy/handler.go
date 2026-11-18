@@ -128,10 +128,12 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 	}
 	resource := s.resourceFor(r.URL.Path, gql)
 	kind := route.Classify(r.Method, r.URL.Path, body)
-	if gql && s.sameCred && !cl.canWrite {
-		// One credential does both jobs, so a GraphQL document the parser
-		// calls a query still runs with the write credential.
-		s.refuse(w, rc, http.StatusForbidden, "ghgate: this client token cannot write, and GraphQL needs a write-capable credential when no separate read credential is configured")
+	owner := s.ownerFor(r.URL.Path)
+	viaWrite := s.readViaWrite(owner)
+	if gql && (s.sameCred || viaWrite) && !cl.canWrite {
+		// The write credential does the read too, so a GraphQL document the
+		// parser calls a query still runs with it.
+		s.refuse(w, rc, http.StatusForbidden, "ghgate: this client token cannot write, and GraphQL runs with the write credential here (no separate read credential, or no default_owner for an App read credential)")
 		rc.outcome = "bypass"
 		return
 	}
@@ -140,7 +142,7 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 		return
 	}
 	in := &apiReq{method: r.Method, base: t.base, uri: r.URL.RequestURI(), hdr: apiHeaders(r.Header), body: body,
-		owner: ownerOf(r.URL.Path), resource: resource, cacheable: r.Method == http.MethodGet}
+		owner: owner, resource: resource, cacheable: r.Method == http.MethodGet}
 	if gql {
 		sum := sha256.Sum256(body)
 		in.bodyHash = hex.EncodeToString(sum[:])
@@ -153,13 +155,17 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 	}
 	ctx := context.WithoutCancel(r.Context())
 	// Only clients that may write get the write-credential retry, so they must not share a flight with those that may not.
-	retry := cl.canWrite && !s.sameCred
-	fk := in.key(hRead) + "|retry=" + strconv.FormatBool(retry)
-	v, shared := s.flights.Do(fk, func() any { return s.fetchRead(ctx, in, retry) })
+	retry := cl.canWrite && !s.sameCred && !viaWrite
+	first := hRead
+	if viaWrite {
+		first = hWrite
+	}
+	fk := in.key(first) + "|retry=" + strconv.FormatBool(retry)
+	v, shared := s.flights.Do(fk, func() any { return s.fetchRead(ctx, in, retry, first) })
 	res := v.(*result)
 	if shared && res.overflow && res.err == nil {
 		// Too big to share: fetch privately.
-		res = s.fetchRead(ctx, in, retry)
+		res = s.fetchRead(ctx, in, retry, first)
 		shared = false
 	}
 	if res.err != nil {
@@ -179,8 +185,8 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 }
 
 // fetchRead serves a read with the read credential, retrying once with the write credential on 404/403.
-func (s *Server) fetchRead(ctx context.Context, in *apiReq, retry bool) *result {
-	res := s.upstream(ctx, in, hRead, s.cfg.Floor)
+func (s *Server) fetchRead(ctx context.Context, in *apiReq, retry bool, first string) *result {
+	res := s.upstream(ctx, in, first, s.cfg.Floor)
 	if retry && res.err == nil && !res.refusal && (res.status == http.StatusNotFound || res.status == http.StatusForbidden) && !rateLimited(res) {
 		// The retry still draws on the shared bucket, so it keeps the read floor.
 		res2 := s.upstream(ctx, in, hWrite, s.cfg.Floor)
@@ -370,7 +376,7 @@ func (s *Server) handleWrite(w *statusWriter, r *http.Request, cl *client, t tar
 		return
 	}
 	ctx := r.Context()
-	tok, label, err := s.write.Token(ctx, ownerOf(r.URL.Path))
+	tok, label, err := s.write.Token(ctx, s.ownerFor(r.URL.Path))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"message": "ghgate: write credential unavailable"})
 		return
@@ -543,6 +549,20 @@ func setUA(h http.Header) {
 	if h.Get("User-Agent") == "" {
 		h.Set("User-Agent", "ghgate")
 	}
+}
+
+// ownerFor is the owner a request is about; requests with none use default_owner.
+func (s *Server) ownerFor(path string) string {
+	if o := ownerOf(path); o != "" {
+		return o
+	}
+	return s.cfg.DefaultOwner
+}
+
+// readViaWrite: with an App read credential, a request that names no owner has no installation to use,
+// so it is read with the write credential (and then the can_write rules apply).
+func (s *Server) readViaWrite(owner string) bool {
+	return owner == "" && !s.sameCred && s.cfg.Read.App != nil
 }
 
 func ownerOf(path string) string {

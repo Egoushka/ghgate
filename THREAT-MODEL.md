@@ -9,7 +9,7 @@
 
 | Threat | Mitigation |
 |---|---|
-| A stolen CA key lets someone intercept any TLS site for clients that trust it. | x509 name constraints limit the CA to the intercepted GitHub hosts. Clients trust it only through `SSL_CERT_FILE`/`sslCAInfo`, never the system store. The key file is mode 0600. |
+| A stolen CA key lets someone intercept any TLS site for clients that trust it. | One CA per intercepted host, each constrained to that exact host (subdomains excluded) and excluding all IP, email and URI names, so a leaked key forges one GitHub host and nothing else (AC9, checked in Go and OpenSSL). Clients trust the bundle only through `SSL_CERT_FILE`/`sslCAInfo`, never the system store. The key files are mode 0600, and ghgate refuses to start when a key or the state directory is group- or world-accessible. |
 | Anyone who reaches the listener spends the owner's PAT. | Every intercepted request needs a client token. Only SHA-256 hashes are stored. The listener binds to loopback or a private address, never `0.0.0.0` by default. |
 | An agent that should only read pushes or merges. | `can_write` per client; without it, every write method, GraphQL mutation and `git-receive-pack` gets 403. |
 | The proxy becomes an open relay, or a way into the internal network. | `tunnel_others` defaults to false. `CONNECT` itself needs the client token (`Proxy-Authorization`, else 407). Tunnels refuse loopback, private, link-local, ULA, CGNAT, unspecified and multicast addresses, checked on the dialled IP so DNS rebinding cannot get past it, never reach the admin listener, and close when idle. The listener is not public. |
@@ -21,7 +21,6 @@
 **Did we do a good enough job.** Every mitigation above has an acceptance check in `SPEC.md`, except "not public",
 which is a property of the deployment.
 
-## Known limits (not yet accepted by the owner)
+## Known limits
 
-- **The CA constraint covers subdomains.** A DNS name constraint of `github.com` permits every `*.github.com`, so a leaked CA key can forge `evil.github.com` for clients that trust the CA. IP, email and URI names are excluded outright. AC9 pins this behaviour. The key file is mode 0600 and ghgate refuses to start when the key or state directory is group- or world-accessible.
-- **App mode without an owner in the path** (GraphQL, `/user`) uses the lowest-id installation. GraphQL answers an unreachable repository with `200` and partial data, so the 404/403 retry cannot repair that.
+None.

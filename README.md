@@ -12,11 +12,14 @@ Status: v0. See [SPEC.md](SPEC.md) and [THREAT-MODEL.md](THREAT-MODEL.md).
 go build -o ghgate ./cmd/ghgate
 cp ghgate.example.json ghgate.json          # fill in credentials; printf %s "$TOKEN" | ./ghgate hash-token for each client
 ./ghgate serve --config ghgate.json &       # proxy on 127.0.0.1:8899, stats on 127.0.0.1:8898
-./ghgate ca --config ghgate.json > ghgate-ca.pem
-cat /etc/ssl/certs/ca-certificates.crt ghgate-ca.pem > bundle.pem   # the CA only covers api.github.com and github.com
+./ghgate ca --config ghgate.json > ghgate-ca.pem   # one CA certificate per intercepted host
+cat /etc/ssl/certs/ca-certificates.crt ghgate-ca.pem > bundle.pem   # each CA covers exactly its own host
 ```
 
-The CA carries x509 name constraints, so it can sign only for the intercepted hosts. Clients trust it through a CA
+Each intercepted host has its own CA with x509 name constraints: it can sign for that exact host only, not for its
+subdomains, IP addresses, emails or URIs. Checked with Go and with OpenSSL (`openssl verify`: `evil.github.com` fails with
+"excluded subtree violation"). A CA left from an older single-CA state directory is refused at start-up; move `ca.pem` and
+`ca.key` out of `state_dir` and re-trust the new bundle. Clients trust it through a CA
 bundle they are pointed at, never the system store.
 
 ## Client setup
@@ -50,9 +53,13 @@ A client token is checked against the SHA-256 stored in the config, then replace
 and other internal destinations, and the admin listener.
 
 **GitHub App mode.** A request with an owner in the path (`/repos/o/...`, `/orgs/o`, `/users/o`) uses that owner's
-installation. A request without one (GraphQL, `/user`) uses the installation with the lowest id. GraphQL answers a
-repository the installation cannot see with `200` and partial data, not a 404, so the write-credential retry does not
-cover it: query GraphQL with a PAT, or accept the gaps.
+installation. A request without one (GraphQL, `/user`, `/repositories/N`) uses the installation of `default_owner` when
+you set it. Otherwise it is read with the `write` credential: plain `GET`s for any client, GraphQL only for clients with
+`can_write`. GraphQL answers a repository the installation cannot see with `200` and partial data, not a 404, so the
+write-credential retry does not cover it.
+
+**Read-only clients and git.** A client without `can_write` gets git upload-pack on `github.com` and nothing else there:
+no LFS batch, no archive or raw downloads, no web pages. Give such a client `can_write`, or use the API, for those.
 
 ## How it differs
 

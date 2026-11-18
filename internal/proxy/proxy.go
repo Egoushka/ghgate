@@ -4,6 +4,7 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -15,6 +16,8 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,7 +53,7 @@ type client struct {
 
 type Server struct {
 	cfg        *config.Config
-	ca         *ca.CA
+	ca         *ca.Set
 	cache      *cache.Cache
 	flights    cache.Group
 	floor      *floor.Tracker
@@ -73,7 +76,7 @@ type Server struct {
 }
 
 func New(cfg *config.Config, opt Options) (*Server, error) {
-	authority, err := ca.LoadOrCreate(cfg.StateDir, cfg.InterceptHosts)
+	authority, err := ca.LoadOrCreateSet(cfg.StateDir, cfg.InterceptHosts)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +136,7 @@ func New(cfg *config.Config, opt Options) (*Server, error) {
 		return creds.NewApp(c.App.ID, c.App.KeyFile, apiBase, hc)
 	}
 	s.write = mk(cfg.Write)
-	s.sameCred = cfg.Read == cfg.Write
+	s.sameCred = credID(cfg.Read) == credID(cfg.Write)
 	if s.sameCred {
 		s.read = s.write
 	} else {
@@ -148,7 +151,22 @@ func New(cfg *config.Config, opt Options) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) CA() *ca.CA { return s.ca }
+// credID names the credential, so two config entries for the same file or App are one credential.
+func credID(c *config.Cred) string {
+	if c.App != nil {
+		return "app:" + strconv.FormatInt(c.App.ID, 10)
+	}
+	p, err := filepath.Abs(c.PatFile)
+	if err != nil {
+		p = c.PatFile
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	return "pat:" + p
+}
+
+func (s *Server) CA() *ca.Set { return s.ca }
 
 // ServeHTTP accepts CONNECT; plain proxy requests are refused.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -387,9 +405,30 @@ var blockedNets = func() []*net.IPNet {
 	return out
 }()
 
+// embeddedIPv4 extracts the IPv4 address carried by NAT64 (64:ff9b::/96), 6to4 (2002::/16)
+// and IPv4-compatible (::a.b.c.d) addresses, which a dual-stack path may route to that IPv4 host.
+func embeddedIPv4(ip net.IP) (net.IP, bool) {
+	ip16 := ip.To16()
+	if ip16 == nil || ip.To4() != nil {
+		return nil, false
+	}
+	switch {
+	case bytes.HasPrefix(ip16, []byte{0, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0}):
+		return net.IP(ip16[12:16]), true
+	case ip16[0] == 0x20 && ip16[1] == 0x02:
+		return net.IP(ip16[2:6]), true
+	case bytes.Equal(ip16[:12], make([]byte, 12)):
+		return net.IP(ip16[12:16]), true
+	}
+	return nil, false
+}
+
 func blockedIP(ip net.IP) bool {
 	if a, ok := netip.AddrFromSlice(ip); ok {
 		ip = net.IP(a.Unmap().AsSlice())
+	}
+	if emb, ok := embeddedIPv4(ip); ok && blockedIP(emb) {
+		return true
 	}
 	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
 		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {

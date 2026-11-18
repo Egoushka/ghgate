@@ -38,6 +38,7 @@ type Config struct {
 	CacheMB        int      `json:"cache_mb"`
 	MaxEntryMB     int      `json:"max_entry_mb"`
 	MaxBuffers     int      `json:"max_inflight_buffers"`
+	DefaultOwner   string   `json:"default_owner"`
 	FreshForMS     int      `json:"fresh_for_ms"`
 	Floor          int      `json:"floor"`
 	WriteFloor     int      `json:"write_floor"`
@@ -92,6 +93,7 @@ func (c *Config) Normalize() error {
 	if c.MaxBuffers <= 0 {
 		c.MaxBuffers = 64
 	}
+	c.DefaultOwner = strings.ToLower(strings.TrimSpace(c.DefaultOwner))
 	if c.Floor == 0 {
 		c.Floor = 300
 	}

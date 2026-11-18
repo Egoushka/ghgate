@@ -184,3 +184,45 @@ func TestAppMintDoesNotBlockOtherOwnersAndIsShared(t *testing.T) {
 		t.Fatalf("mints %v", mints)
 	}
 }
+
+func TestFailedInstallationLoadBacksOffFor60Seconds(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	keyFile := filepath.Join(t.TempDir(), "app.pem")
+	os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600)
+	var mu sync.Mutex
+	loads := 0
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		loads++
+		mu.Unlock()
+		w.WriteHeader(500)
+	}))
+	defer srv.Close()
+	clock := time.Now()
+	a := NewApp(1, keyFile, srv.URL, srv.Client())
+	a.now = func() time.Time { mu.Lock(); defer mu.Unlock(); return clock }
+	for i := 0; i < 5; i++ {
+		if _, _, err := a.Token(context.Background(), "acme"); err == nil {
+			t.Fatal("expected an error")
+		}
+	}
+	mu.Lock()
+	if loads != 1 {
+		t.Fatalf("a failing /app/installations was called %d times in a row, want 1", loads)
+	}
+	clock = clock.Add(61 * time.Second)
+	mu.Unlock()
+	a.Token(context.Background(), "acme")
+	mu.Lock()
+	defer mu.Unlock()
+	if loads != 2 {
+		t.Fatalf("after the back-off it must try again: %d loads", loads)
+	}
+}
+
+func TestAppWithoutOwnerHasNoInstallation(t *testing.T) {
+	a := NewApp(1, "unused", "https://127.0.0.1:1", http.DefaultClient)
+	if _, _, err := a.Token(context.Background(), ""); !errors.Is(err, ErrNoInstallation) {
+		t.Fatalf("an empty owner must not pick an installation: %v", err)
+	}
+}
