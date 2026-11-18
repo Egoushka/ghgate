@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -24,6 +25,8 @@ import (
 const usage = `usage:
   ghgate serve --config ghgate.json   run the proxy
   ghgate ca --config ghgate.json      print the CA certificate (PEM), creating it if needed
+  ghgate healthcheck --config ghgate.json
+                                      GET the admin /healthz; exit 0 on 200, else 1 (for a container with no shell)
   ghgate hash-token                   read a token on stdin, print its SHA-256`
 
 func main() {
@@ -37,6 +40,8 @@ func main() {
 		err = serve(os.Args[2:])
 	case "ca":
 		err = printCA(os.Args[2:])
+	case "healthcheck":
+		err = healthcheck(os.Args[2:])
 	case "hash-token":
 		err = hashToken(os.Stdin, os.Stdout)
 	default:
@@ -98,6 +103,47 @@ func printCA(args []string) error {
 	}
 	_, err = os.Stdout.Write(c.CertPEM())
 	return err
+}
+
+func healthcheck(args []string) error {
+	cfg, err := loadConfig(args, "healthcheck")
+	if err != nil {
+		return err
+	}
+	u, err := healthURL(cfg.Admin)
+	if err != nil {
+		return err
+	}
+	return checkHealth(u)
+}
+
+// healthURL dials loopback when admin listens on a wildcard address.
+func healthURL(admin string) (string, error) {
+	host, port, err := net.SplitHostPort(admin)
+	if err != nil {
+		return "", fmt.Errorf("admin address %q: %w", admin, err)
+	}
+	if ip := net.ParseIP(host); host == "" || (ip != nil && ip.IsUnspecified()) {
+		if ip != nil && ip.To4() == nil {
+			host = "::1"
+		} else {
+			host = "127.0.0.1"
+		}
+	}
+	return "http://" + net.JoinHostPort(host, port) + "/healthz", nil
+}
+
+func checkHealth(url string) error {
+	resp, err := (&http.Client{Timeout: 5 * time.Second}).Get(url)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<10))
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("healthz returned %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func hashToken(in io.Reader, out io.Writer) error {
