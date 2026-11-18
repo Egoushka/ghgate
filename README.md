@@ -19,7 +19,8 @@ cat /etc/ssl/certs/ca-certificates.crt ghgate-ca.pem > bundle.pem   # each CA co
 ### Container
 
 `ghcr.io/egoushka/ghgate:<version>` is a static binary on distroless (no shell), running as uid 65532 with `/state`
-(mode 0700) for the CA keys: mount a volume there and set `"state_dir": "/state"`. Secrets reach it as environment
+(mode 0700) for the CA keys: mount a volume there and set `"state_dir": "/state"`. A fresh volume may come up 0755;
+ghgate sets a state directory it owns to 0700 and refuses one owned by another user that others can read. Secrets reach it as environment
 variables, so credentials take an env form next to the file form:
 
 ```json
