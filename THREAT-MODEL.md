@@ -21,7 +21,7 @@
 **Did we do a good enough job.** Every mitigation above has an acceptance check in `SPEC.md`, except "not public",
 which is a property of the deployment.
 
-## Accepted risks
+## Known limits (not yet accepted by the owner)
 
 - **The CA constraint covers subdomains.** A DNS name constraint of `github.com` permits every `*.github.com`, so a leaked CA key can forge `evil.github.com` for clients that trust the CA. IP, email and URI names are excluded outright. AC9 pins this behaviour. The key file is mode 0600 and ghgate refuses to start when the key or state directory is group- or world-accessible.
 - **App mode without an owner in the path** (GraphQL, `/user`) uses the lowest-id installation. GraphQL answers an unreachable repository with `200` and partial data, so the 404/403 retry cannot repair that.
