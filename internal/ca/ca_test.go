@@ -100,6 +100,34 @@ func TestOldSingleCALayoutIsRefused(t *testing.T) {
 	}
 }
 
+// A fresh container volume carries the image directory's 0755: ghgate's own directory is tightened, not refused.
+func TestOwnOpenStateDirIsTightened(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "state")
+	os.MkdirAll(dir, 0o755)
+	os.Chmod(dir, 0o755)
+	if _, err := LoadOrCreateSet(dir, []string{"github.com"}); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o700 {
+		t.Fatalf("state dir mode %v, want 0700", fi.Mode().Perm())
+	}
+}
+
+// Someone else's open directory is not ours to change.
+func TestOtherOwnersStateDirIsLeftAlone(t *testing.T) {
+	dir := t.TempDir()
+	os.Chmod(dir, 0o755)
+	if err := tightenOwn(dir, os.Geteuid()+1); err != nil {
+		t.Fatal(err)
+	}
+	if fi, _ := os.Stat(dir); fi.Mode().Perm() != 0o755 {
+		t.Fatalf("mode %v changed", fi.Mode().Perm())
+	}
+	if requirePrivate(dir) == nil {
+		t.Fatal("an open directory must still be refused")
+	}
+}
+
 // OpenSSL must honour the constraints too, not only Go.
 func TestOpenSSLHonoursPerHostConstraints(t *testing.T) {
 	ossl, err := exec.LookPath("openssl")

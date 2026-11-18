@@ -243,6 +243,9 @@ func LoadOrCreateSet(dir string, hosts []string) (*Set, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
+	if err := tightenOwn(dir, os.Geteuid()); err != nil {
+		return nil, err
+	}
 	if err := requirePrivate(dir); err != nil {
 		return nil, err
 	}
