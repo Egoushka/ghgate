@@ -9,17 +9,18 @@
 
 | Threat | Mitigation |
 |---|---|
-| A stolen CA key lets someone intercept any TLS site for clients that trust it. | x509 name constraints limit the CA to the intercepted GitHub hosts. Clients trust it only through `SSL_CERT_FILE`/`sslCAInfo`, never the system store. The key file is mode 0600. |
+| A stolen CA key lets someone intercept any TLS site for clients that trust it. | One CA per intercepted host, each constrained to that exact host (subdomains excluded) and excluding all IP, email and URI names, so a leaked key forges one GitHub host and nothing else (AC9, checked in Go and OpenSSL). Clients trust the bundle only through `SSL_CERT_FILE`/`sslCAInfo`, never the system store. The key files are mode 0600, and ghgate refuses to start when a key or the state directory is group- or world-accessible. |
 | Anyone who reaches the listener spends the owner's PAT. | Every intercepted request needs a client token. Only SHA-256 hashes are stored. The listener binds to loopback or a private address, never `0.0.0.0` by default. |
 | An agent that should only read pushes or merges. | `can_write` per client; without it, every write method, GraphQL mutation and `git-receive-pack` gets 403. |
-| The proxy becomes an open relay to the internet. | Tunnelling other hosts can be switched off (`tunnel_others: false`). The listener is not public. |
-| Cache poisoning or a cross-identity leak: a write-scoped answer is served to a read-only client. | The cache key includes the credential kind. Entries are stored only from upstream responses. Every hit is revalidated, so a revoked resource answers 404 upstream and the entry is dropped. |
+| The proxy becomes an open relay, or a way into the internal network. | `tunnel_others` defaults to false. `CONNECT` itself needs the client token (`Proxy-Authorization`, else 407). Tunnels refuse loopback, private, link-local, ULA, CGNAT, unspecified and multicast addresses, checked on the dialled IP so DNS rebinding cannot get past it, never reach the admin listener, and close when idle. The listener is not public. |
+| Cache poisoning or a cross-identity leak: a write-scoped answer is served to a read-only client. | The cache key includes the credential kind, and the write-credential retry after a 404/403 happens only for clients with `can_write` (read-only clients never see an answer fetched with the write credential). Entries are stored only from upstream responses. Every hit is revalidated, so a revoked resource answers 404 upstream and the entry is dropped. |
 | Secrets end up in logs. | No token, `Authorization` value or body is ever logged; AC10 tests it. |
-| A GraphQL mutation hidden from the parser gets the read credential. | The read credential has fewer rights than the write one, so a misrouted mutation fails rather than escalating. |
+| A GraphQL mutation hidden from the parser gets the read credential. | The body must be one object with exactly the keys `query`, `variables`, `operationName` (matched case-sensitively, no duplicates); batches and anything unparseable are writes. The read credential has fewer rights than the write one, so a misrouted mutation fails rather than escalating. When no separate read credential exists, every GraphQL POST needs `can_write`. |
+| A read-only client pushes through `github.com`, or smuggles a method (`X-HTTP-Method-Override`). | Only exact upload-pack paths are read-only (percent-encoding and `;` are refused); everything else on `github.com` needs `can_write`. Method-override headers are stripped before anything goes upstream. |
 
 **Did we do a good enough job.** Every mitigation above has an acceptance check in `SPEC.md`, except "not public",
 which is a property of the deployment.
 
-## Accepted risks
+## Known limits
 
-None yet.
+None.
