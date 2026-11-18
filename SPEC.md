@@ -39,7 +39,7 @@ cached answer makes a waiting tool such as `ws wait` decide wrongly.
   - `ghgate ca` prints the bundle of all CA certificates (public certificates only, never keys). The admin listener serves the same bytes at `GET /ca.pem` (`Content-Type: application/x-pem-file`): this is how clients fetch the CA when ghgate runs in a container.
 - **Every other host** is tunnelled byte for byte, without interception, only when `tunnel_others` is true (default false). Tunnels refuse loopback, private, link-local, ULA, CGNAT, unspecified and multicast destinations (checked on the resolved address) and the admin listener, and close after 5 min idle.
 - **`CONNECT` needs the client token** as `Proxy-Authorization` (Basic with the token as the password, or Bearer); without it the answer is `407`.
-- **Admin listener.** A second listener, on loopback by default, serves `GET /stats`, `GET /healthz` and `GET /ca.pem`. It has no authentication, so it stays on loopback or a private container network.
+- **Admin listener.** A second listener, on loopback by default, serves `GET /stats`, `GET /healthz` and `GET /ca.pem`. It has no authentication, so it stays on loopback or a private network such as the tailnet.
 - **Health check without a shell.** `ghgate healthcheck --config ghgate.json` GETs `/healthz` on the config's `admin` address and exits 0 on `200`, else 1. A wildcard admin address (`0.0.0.0:8898`, `:8898`, `[::]:8898`) is dialled on loopback.
 
 **Client identity.** Every intercepted request must carry a client token from the config, in one of two places:
