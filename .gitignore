@@ -1,0 +1,5 @@
+/ghgate
+/dist/
+*.pem
+*.key
+state/
