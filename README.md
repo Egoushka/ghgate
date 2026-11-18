@@ -16,6 +16,23 @@ cp ghgate.example.json ghgate.json          # fill in credentials; printf %s "$T
 cat /etc/ssl/certs/ca-certificates.crt ghgate-ca.pem > bundle.pem   # each CA covers exactly its own host
 ```
 
+### Container
+
+`ghcr.io/egoushka/ghgate:<version>` is a static binary on distroless (no shell), running as uid 65532 with `/state`
+(mode 0700) for the CA keys: mount a volume there and set `"state_dir": "/state"`. Secrets reach it as environment
+variables, so credentials take an env form next to the file form:
+
+```json
+"read":  {"app": {"id": 123456, "key_env": "GHGATE_APP_KEY"}},
+"write": {"pat_env": "GHGATE_PAT"}
+```
+
+`key_env` holds the App key as PEM text or as its base64. Each credential names exactly one of file or env; env is read
+once at start. See `ghgate.container.example.json` (listeners on `0.0.0.0`, which is only safe on a private network: the
+admin listener has no authentication). The image runs `serve --config /etc/ghgate/ghgate.json` by default; mount the
+config there. Compose health check, with no shell: `test: ["CMD", "/ghgate", "healthcheck", "--config", "/etc/ghgate/ghgate.json"]`.
+Clients fetch the CA with `curl http://<ghgate>:8898/ca.pem` (public certificates only).
+
 Each intercepted host has its own CA with x509 name constraints: it can sign for that exact host only, not for its
 subdomains, IP addresses, emails or URIs. Checked with Go and with OpenSSL (`openssl verify`: `evil.github.com` fails with
 "excluded subtree violation"). A CA left from an older single-CA state directory is refused at start-up; move `ca.pem` and
@@ -74,7 +91,7 @@ no LFS batch, no archive or raw downloads, no web pages. Give such a client `can
 
 Reads (`GET`, and GraphQL documents without a `mutation`) use the read credential and are cached. Everything else uses the
 write credential and needs `can_write`; a write drops the cached entries of the repo it touched. Below `floor` remaining
-calls, reads get `429` with `Retry-After`. `GET /stats` and `GET /healthz` are on the admin listener. Logs are one JSON
+calls, reads get `429` with `Retry-After`. `GET /stats`, `GET /healthz` and `GET /ca.pem` are on the admin listener. Logs are one JSON
 line per request and never hold tokens, query strings or bodies.
 
 Tests: `go vet ./... && go test -race ./...`. Live check: `scripts/e2e.sh` (needs a real PAT).

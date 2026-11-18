@@ -36,10 +36,11 @@ cached answer makes a waiting tool such as `ws wait` decide wrongly.
   - There is **one CA per intercepted host**, generated on first start (ECDSA P-256) into `state_dir/ca/<host>/`, with the key at mode 0600.
   - Each CA's **x509 name constraints** permit only its exact host (for `github.com`: permitted `github.com`, excluded `.github.com`) and exclude all IP, email and URI names. A leaked key therefore forges one host and nothing else, not even its subdomains.
   - A CA left over from the old single-CA layout (`state_dir/ca.pem`) is refused at start-up with a message.
-  - `ghgate ca` prints the bundle of all CA certificates.
+  - `ghgate ca` prints the bundle of all CA certificates (public certificates only, never keys). The admin listener serves the same bytes at `GET /ca.pem` (`Content-Type: application/x-pem-file`): this is how clients fetch the CA when ghgate runs in a container.
 - **Every other host** is tunnelled byte for byte, without interception, only when `tunnel_others` is true (default false). Tunnels refuse loopback, private, link-local, ULA, CGNAT, unspecified and multicast destinations (checked on the resolved address) and the admin listener, and close after 5 min idle.
 - **`CONNECT` needs the client token** as `Proxy-Authorization` (Basic with the token as the password, or Bearer); without it the answer is `407`.
-- **Admin listener.** A second listener, on loopback by default, serves `GET /stats` and `GET /healthz`.
+- **Admin listener.** A second listener, on loopback by default, serves `GET /stats`, `GET /healthz` and `GET /ca.pem`. It has no authentication, so it stays on loopback or a private container network.
+- **Health check without a shell.** `ghgate healthcheck --config ghgate.json` GETs `/healthz` on the config's `admin` address and exits 0 on `200`, else 1. A wildcard admin address (`0.0.0.0:8898`, `:8898`, `[::]:8898`) is dialled on loopback.
 
 **Client identity.** Every intercepted request must carry a client token from the config, in one of two places:
 - `Authorization: token|Bearer <t>`, for the API;
@@ -52,9 +53,12 @@ Rules:
 
 **Upstream credentials.** The config has a `read` credential and a `write` credential. Each is one of:
 - `{"pat_file": path}`. The file is re-read when its mtime changes, so a rotation needs no restart.
-- `{"app": {"id": N, "key_file": path}}`. ghgate mints an installation token for each owner, finding the installation through `GET /app/installations`, and renews it 10 min before it expires.
+- `{"pat_env": "NAME"}`. The token is the value of environment variable `NAME`, read once at start (a rotation needs a restart). An unset or empty variable stops the start with an error naming the variable.
+- `{"app": {"id": N, "key_file": path}}`. ghgate mints an installation token for each owner, finding the installation through `GET /app/installations`, and renews it 10 min before it expires. `{"app": {"id": N, "key_env": "NAME"}}` takes the key from environment variable `NAME` instead, read once at start: the value is PEM text (it contains `-----BEGIN`) or the base64 of that PEM. A bad value stops the start; errors name the variable and never print the value.
 
-When `read` is omitted, it falls back to `write`; every GraphQL POST then needs `can_write`, because it runs with the write credential. Two entries are one credential when they name the same `pat_file` (after resolving symlinks) or the same App id.
+Exactly one of `pat_file`, `pat_env` or `app` per credential, and exactly one of `key_file` or `key_env` per App; anything else is rejected at load. Environment variables exist for containers, where secrets reach the process only as environment (an `env_file`) and the image has no shell.
+
+When `read` is omitted, it falls back to `write`; every GraphQL POST then needs `can_write`, because it runs with the write credential. Two entries are one credential when they name the same `pat_file` (after resolving symlinks), the same `pat_env`, or the same App id.
 
 **App mode and the owner.** A request names an owner in the path (`/repos/o/...`, `/orgs/o`, `/users/o`). One without (GraphQL, `/user`, `/repositories/N`) uses the installation of `default_owner` when that is set. Otherwise only clients with `can_write` get it, read with the `write` credential; a read-only client gets `403` before anything goes upstream (gate r3). There is no "first installation" guess. GraphQL answers a repository the installation cannot see with `200` and partial data, so the 404/403 retry does not cover it. A failed `/app/installations` load is not retried for 60 s.
 
