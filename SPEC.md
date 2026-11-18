@@ -36,7 +36,8 @@ cached answer makes a waiting tool such as `ws wait` decide wrongly.
   - It is generated on first start (ECDSA P-256) into the state directory, with the key at mode 0600.
   - Its **x509 name constraints** permit only the intercepted hosts, so a leaked CA key cannot forge other sites.
   - `ghgate ca` prints the PEM of the CA certificate.
-- **Every other host** is tunnelled byte for byte, without interception, or refused when `tunnel_others` is false.
+- **Every other host** is tunnelled byte for byte, without interception, only when `tunnel_others` is true (default false). Tunnels refuse loopback, private, link-local, ULA, CGNAT, unspecified and multicast destinations (checked on the resolved address) and the admin listener, and close after 5 min idle.
+- **`CONNECT` needs the client token** as `Proxy-Authorization` (Basic with the token as the password, or Bearer); without it the answer is `407`.
 - **Admin listener.** A second listener, on loopback by default, serves `GET /stats` and `GET /healthz`.
 
 **Client identity.** Every intercepted request must carry a client token from the config, in one of two places:
@@ -52,16 +53,16 @@ Rules:
 - `{"pat_file": path}`. The file is re-read when its mtime changes, so a rotation needs no restart.
 - `{"app": {"id": N, "key_file": path}}`. ghgate mints an installation token for each owner, finding the installation through `GET /app/installations`, and renews it 10 min before it expires.
 
-When `read` is omitted, it falls back to `write`.
+When `read` is omitted, it falls back to `write`; every GraphQL POST then needs `can_write`, because it runs with the write credential.
 
 **Routing.**
 
 | Request | Credential | Cache |
 |---|---|---|
-| `GET`/`HEAD` on the API | read; if read answers 404 or 403, retried once with write (the App may not be installed on that repo) | yes |
-| `POST /graphql` whose document has no `mutation` operation | read (with the same 404/403 retry) | no; identical concurrent bodies are coalesced |
+| `GET`/`HEAD` on the API | read; if read answers 404 or 403 (not a rate-limit 403), retried once with write, for a client with `can_write` only and while the bucket is above `floor` (the App may not be installed on that repo) | yes |
+| `POST /graphql` whose body is exactly one object with the keys `query`, `variables`, `operationName` and a document with only queries (a batch, a duplicate or unknown key, or anything unparseable is a write) | read (with the same 404/403 retry) | no; identical concurrent bodies are coalesced |
 | `POST /graphql` with a mutation, and any other method on the API | write. `403` when the client lacks `can_write` | no; it invalidates cached entries under the `/repos/{owner}/{repo}` it touched |
-| `github.com` (git smart HTTP, web) | write, as Basic `x-access-token:<token>`. `git-receive-pack` needs `can_write` | no, streamed |
+| `github.com` (git smart HTTP, web) | write, as Basic `x-access-token:<token>`. Only `GET /{o}/{r}[.git]/info/refs?service=git-upload-pack` and `POST /{o}/{r}[.git]/git-upload-pack` are open to read-only clients; everything else needs `can_write` | no, streamed |
 
 **Cache.**
 - **Key:** credential kind (`read` or `write`), method, full URL, and the `Accept` and `X-GitHub-Api-Version` headers.
@@ -93,7 +94,7 @@ When `read` is omitted, it falls back to `write`.
 | AC4 | A missing or unknown client token gets 401, with 0 upstream requests. A client without `can_write` gets 403 on a write. |
 | AC5 | A `POST /repos/o/r/issues` drops the cached `GET /repos/o/r/issues` (the next GET is a `miss`), and keeps `/repos/o/other`. |
 | AC6 | Below the floor, a read gets 429 with `Retry-After`, with 0 upstream requests. A write still passes. |
-| AC7 | A read answered 404 by the read credential is retried once with the write credential. |
+| AC7 | A read answered 404 by the read credential is retried once with the write credential, for a client with `can_write`. A client without it gets the 404. |
 | AC8 | CONNECT to a host that is not intercepted is tunnelled: the client sees the origin's own certificate. |
 | AC9 | A leaf certificate for `api.github.com` verifies against the CA, and a leaf ghgate is made to sign for `example.com` fails verification (name constraints). |
 | AC10 | Captured logs contain no client or upstream token substring. |

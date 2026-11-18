@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -125,11 +126,16 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 			return
 		}
 	}
-	resource := "core"
-	if gql {
-		resource = "graphql"
+	resource := s.resourceFor(r.URL.Path, gql)
+	kind := route.Classify(r.Method, r.URL.Path, body)
+	if gql && s.sameCred && !cl.canWrite {
+		// One credential does both jobs, so a GraphQL document the parser
+		// calls a query still runs with the write credential.
+		s.refuse(w, rc, http.StatusForbidden, "ghgate: this client token cannot write, and GraphQL needs a write-capable credential when no separate read credential is configured")
+		rc.outcome = "bypass"
+		return
 	}
-	if route.Classify(r.Method, r.URL.Path, body) == route.Write {
+	if kind == route.Write {
 		s.handleWrite(w, r, cl, t, rc, body, gql, resource)
 		return
 	}
@@ -146,11 +152,14 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 		}
 	}
 	ctx := context.WithoutCancel(r.Context())
-	v, shared := s.flights.Do(in.key(hRead), func() any { return s.fetchRead(ctx, in) })
+	// Only clients that may write get the write-credential retry, so they must not share a flight with those that may not.
+	retry := cl.canWrite && !s.sameCred
+	fk := in.key(hRead) + "|retry=" + strconv.FormatBool(retry)
+	v, shared := s.flights.Do(fk, func() any { return s.fetchRead(ctx, in, retry) })
 	res := v.(*result)
 	if shared && res.overflow && res.err == nil {
 		// Too big to share: fetch privately.
-		res = s.fetchRead(ctx, in)
+		res = s.fetchRead(ctx, in, retry)
 		shared = false
 	}
 	if res.err != nil {
@@ -170,28 +179,33 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 }
 
 // fetchRead serves a read with the read credential, retrying once with the write credential on 404/403.
-func (s *Server) fetchRead(ctx context.Context, in *apiReq) *result {
-	res := s.upstream(ctx, in, hRead)
-	if !s.sameCred && res.err == nil && !res.refusal && (res.status == http.StatusNotFound || res.status == http.StatusForbidden) {
-		if res.rest != nil {
-			res.rest.Close()
-		}
-		res2 := s.upstream(ctx, in, hWrite)
-		res2.calls += res.calls
-		res2.ms += res.ms
-		if res2.err == nil {
+func (s *Server) fetchRead(ctx context.Context, in *apiReq, retry bool) *result {
+	res := s.upstream(ctx, in, hRead, s.cfg.Floor)
+	if retry && res.err == nil && !res.refusal && (res.status == http.StatusNotFound || res.status == http.StatusForbidden) && !rateLimited(res) {
+		// The retry still draws on the shared bucket, so it keeps the read floor.
+		res2 := s.upstream(ctx, in, hWrite, s.cfg.Floor)
+		if res2.err == nil && !res2.refusal {
+			if res.rest != nil {
+				res.rest.Close()
+			}
+			res2.calls += res.calls
+			res2.ms += res.ms
 			return res2
 		}
-		res.rest = nil
+		// The retry was refused or failed: the client gets the original answer.
+		res.calls += res2.calls
+		if res2.rest != nil {
+			res2.rest.Close()
+		}
 	}
 	return res
 }
 
 // upstream performs one credential's attempt: conditional request, floor check, caching.
-func (s *Server) upstream(ctx context.Context, in *apiReq, kind string) *result {
-	src, floorN := s.read, s.cfg.Floor
+func (s *Server) upstream(ctx context.Context, in *apiReq, kind string, floorN int) *result {
+	src := s.read
 	if kind == hWrite {
-		src, floorN = s.write, s.cfg.WriteFloor
+		src = s.write
 	}
 	tok, label, err := src.Token(ctx, in.owner)
 	if errors.Is(err, creds.ErrNoInstallation) && kind == hRead {
@@ -240,6 +254,7 @@ func (s *Server) upstream(ctx context.Context, in *apiReq, kind string) *result 
 		return &result{err: errors.New("upstream request failed"), calls: 1}
 	}
 	s.floor.Observe(label, resp.Header)
+	s.learnResource(in.uri, resp.Header)
 	res := &result{status: resp.StatusCode, header: stripHop(resp.Header), calls: 1, outcome: "bypass"}
 	if in.cacheable {
 		res.outcome = "miss"
@@ -268,7 +283,13 @@ func (s *Server) upstream(ctx context.Context, in *apiReq, kind string) *result 
 		s.cache.Delete(key)
 	}
 	limit := s.maxEntry
+	s.bufSem <- struct{}{}
+	if n := s.bufNow.Add(1); n > s.bufPeak.Load() {
+		s.bufPeak.Store(n)
+	}
 	prefix, rerr := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	s.bufNow.Add(-1)
+	<-s.bufSem
 	if rerr != nil {
 		resp.Body.Close()
 		return &result{err: errors.New("upstream read failed"), calls: 1}
@@ -288,6 +309,39 @@ func (s *Server) upstream(ctx context.Context, in *apiReq, kind string) *result 
 			Validated: time.Now(), Repo: repoPrefix(in.uri)}, gen)
 	}
 	return res
+}
+
+// rateLimited reports a 403 that is GitHub's rate limiting, which a second credential must not be spent on.
+func rateLimited(res *result) bool {
+	return res.header.Get("Retry-After") != "" || res.header.Get("X-RateLimit-Remaining") == "0"
+}
+
+func routeKey(path string, gql bool) string {
+	if gql {
+		return "graphql"
+	}
+	return strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)[0]
+}
+
+// resourceFor is the rate-limit resource a path drew on last time, as the upstream reported it.
+func (s *Server) resourceFor(path string, gql bool) string {
+	if v, ok := s.resByPath.Load(routeKey(path, gql)); ok {
+		return v.(string)
+	}
+	if gql {
+		return "graphql"
+	}
+	return "core"
+}
+
+func (s *Server) learnResource(uri string, h http.Header) {
+	if res := h.Get("X-RateLimit-Resource"); res != "" {
+		path := uri
+		if i := strings.IndexByte(path, '?'); i >= 0 {
+			path = path[:i]
+		}
+		s.resByPath.Store(routeKey(path, route.IsGraphQLPath(path)), res)
+	}
 }
 
 func (s *Server) serve(w http.ResponseWriter, res *result, outcome string, rc *rec) {
@@ -357,6 +411,7 @@ func (s *Server) handleWrite(w *statusWriter, r *http.Request, cl *client, t tar
 	}
 	defer resp.Body.Close()
 	s.floor.Observe(label, resp.Header)
+	s.learnResource(r.URL.RequestURI(), resp.Header)
 	if p := repoPrefix(r.URL.RequestURI()); p != "" && !gql {
 		s.cache.InvalidateRepo(p)
 	} else {
@@ -365,11 +420,24 @@ func (s *Server) handleWrite(w *statusWriter, r *http.Request, cl *client, t tar
 	s.pipe(w, resp, rc, false)
 }
 
+var gitReadPath = regexp.MustCompile(`^/[^/]+/[^/]+(\.git)?/(info/refs|git-upload-pack)$`)
+
+// gitReadOnly allow-lists the requests that can only read. The raw path is
+// matched, and anything percent-encoded or carrying ';' is not read-only.
+func gitReadOnly(r *http.Request) bool {
+	raw := r.URL.EscapedPath()
+	if strings.ContainsAny(raw, "%;") || strings.ContainsRune(r.URL.RawQuery, ';') || !gitReadPath.MatchString(raw) {
+		return false
+	}
+	if strings.HasSuffix(raw, "/info/refs") {
+		return r.Method == http.MethodGet && r.URL.RawQuery == "service=git-upload-pack"
+	}
+	return r.Method == http.MethodPost && r.URL.RawQuery == ""
+}
+
 func (s *Server) handleWeb(w *statusWriter, r *http.Request, cl *client, t target, rc *rec) {
 	p := r.URL.Path
-	receive := strings.HasSuffix(p, "/git-receive-pack") || r.URL.Query().Get("service") == "git-receive-pack"
-	readOnly := r.Method == http.MethodGet || r.Method == http.MethodHead || (r.Method == http.MethodPost && strings.HasSuffix(p, "/git-upload-pack"))
-	if (receive || !readOnly) && !cl.canWrite {
+	if !cl.canWrite && !gitReadOnly(r) {
 		s.refuse(w, rc, http.StatusForbidden, "ghgate: this client token cannot write")
 		rc.outcome = "bypass"
 		return
@@ -387,6 +455,7 @@ func (s *Server) handleWeb(w *statusWriter, r *http.Request, cl *client, t targe
 	}
 	req.Header = stripHop(r.Header)
 	req.Header.Del("Authorization")
+	stripOverrides(req.Header)
 	req.SetBasicAuth("x-access-token", tok)
 	setUA(req.Header)
 	if r.ContentLength == 0 {
@@ -403,6 +472,12 @@ func (s *Server) handleWeb(w *statusWriter, r *http.Request, cl *client, t targe
 		return
 	}
 	defer resp.Body.Close()
+	if r.Method == http.MethodPost && strings.HasSuffix(p, "/git-receive-pack") && resp.StatusCode < 400 {
+		parts := strings.Split(strings.TrimPrefix(p, "/"), "/")
+		if len(parts) >= 3 {
+			s.cache.InvalidateRepo("/repos/" + parts[0] + "/" + strings.TrimSuffix(parts[1], ".git"))
+		}
+	}
 	s.pipe(w, resp, rc, true)
 }
 
@@ -453,7 +528,15 @@ func apiHeaders(in http.Header) http.Header {
 	for _, k := range []string{"Authorization", "Accept-Encoding", "If-None-Match", "If-Modified-Since", "Content-Length", "Cookie"} {
 		h.Del(k)
 	}
+	stripOverrides(h)
 	return h
+}
+
+// stripOverrides removes headers that make some servers run a different method than the one we classified.
+func stripOverrides(h http.Header) {
+	for _, k := range []string{"X-HTTP-Method-Override", "X-HTTP-Method", "X-Method-Override"} {
+		h.Del(k)
+	}
 }
 
 func setUA(h http.Header) {

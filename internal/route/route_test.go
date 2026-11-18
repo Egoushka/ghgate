@@ -51,3 +51,28 @@ func TestClassify(t *testing.T) {
 		t.Error("unsure must be write")
 	}
 }
+
+func TestGraphQLBodyEvasions(t *testing.T) {
+	m := `mutation{addStar(input:{starrableId:\"1\"}){clientMutationId}}`
+	q := `{viewer{login}}`
+	cases := map[string]string{
+		"mixed-case key":   `{"query":"` + m + `","QUERY":"` + q + `"}`,
+		"mixed-case first": `{"QUERY":"` + q + `","query":"` + m + `"}`,
+		"duplicate key":    `{"query":"` + m + `","query":"` + q + `"}`,
+		"duplicate swap":   `{"query":"` + q + `","query":"` + m + `"}`,
+		"batch":            `[{"query":"` + q + `"}]`,
+		"extra key":        `{"query":"` + q + `","extensions":{}}`,
+		"trailing data":    `{"query":"` + q + `"} {"query":"` + m + `"}`,
+		"query not string": `{"query":5}`,
+		"no query":         `{"variables":{}}`,
+	}
+	for name, body := range cases {
+		if !GraphQLHasMutation([]byte(body)) {
+			t.Errorf("%s must be treated as a write", name)
+		}
+	}
+	ok := `{"query":"` + q + `","variables":{"a":1},"operationName":null}`
+	if GraphQLHasMutation([]byte(ok)) {
+		t.Error("a plain query body is a read")
+	}
+}

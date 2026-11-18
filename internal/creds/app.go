@@ -12,6 +12,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/Egoushka/ghgate/internal/cache"
 	"net/http"
 	"os"
 	"sort"
@@ -39,8 +40,9 @@ type App struct {
 	apiBase string
 	hc      *http.Client
 	now     func() time.Time
+	flights cache.Group
 
-	mu       sync.Mutex
+	mu       sync.Mutex // guards the fields below; never held across an HTTP call
 	key      *rsa.PrivateKey
 	installs []installation
 	loadedAt time.Time
@@ -51,21 +53,49 @@ func NewApp(id int64, keyFile, apiBase string, hc *http.Client) *App {
 	return &App{id: id, keyFile: keyFile, apiBase: strings.TrimRight(apiBase, "/"), hc: hc, now: time.Now, toks: map[string]cachedTok{}}
 }
 
-func (a *App) Token(ctx context.Context, owner string) (string, string, error) {
-	owner = strings.ToLower(owner)
+type tokResult struct {
+	tok, label string
+	err        error
+}
+
+func (a *App) label(login string) string {
+	return fmt.Sprintf("app:%d:%s", a.id, strings.ToLower(login))
+}
+
+func (a *App) cached(owner string) (string, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	label := fmt.Sprintf("app:%d:%s", a.id, owner)
-	if t, ok := a.toks[owner]; ok && a.now().Before(t.expires.Add(-renewBefore)) {
-		return t.tok, label, nil
+	t, ok := a.toks[owner]
+	if ok && a.now().Before(t.expires.Add(-renewBefore)) {
+		return t.tok, true
 	}
+	return "", false
+}
+
+// Token returns a token for owner. Concurrent calls for one owner share one mint.
+func (a *App) Token(ctx context.Context, owner string) (string, string, error) {
+	owner = strings.ToLower(owner)
+	if tok, ok := a.cached(owner); ok {
+		return tok, a.label(owner), nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	v, _ := a.flights.Do("tok|"+owner, func() any {
+		tok, label, err := a.mint(ctx, owner)
+		return tokResult{tok, label, err}
+	})
+	r := v.(tokResult)
+	return r.tok, r.label, r.err
+}
+
+func (a *App) mint(ctx context.Context, owner string) (string, string, error) {
 	inst, err := a.findInstallation(ctx, owner)
 	if err != nil {
 		return "", "", err
 	}
-	label = fmt.Sprintf("app:%d:%s", a.id, strings.ToLower(inst.login))
-	if t, ok := a.toks[strings.ToLower(inst.login)]; ok && a.now().Before(t.expires.Add(-renewBefore)) {
-		return t.tok, label, nil
+	login := strings.ToLower(inst.login)
+	if tok, ok := a.cached(login); ok {
+		return tok, a.label(login), nil
 	}
 	jwt, err := a.jwt()
 	if err != nil {
@@ -81,47 +111,66 @@ func (a *App) Token(ctx context.Context, owner string) (string, string, error) {
 	if out.Token == "" {
 		return "", "", errors.New("creds: empty installation token")
 	}
-	ct := cachedTok{out.Token, out.ExpiresAt}
-	a.toks[strings.ToLower(inst.login)] = ct
-	a.toks[owner] = ct
-	return out.Token, label, nil
+	a.mu.Lock()
+	a.toks[login] = cachedTok{out.Token, out.ExpiresAt}
+	a.toks[owner] = cachedTok{out.Token, out.ExpiresAt}
+	a.mu.Unlock()
+	return out.Token, a.label(login), nil
 }
 
 // findInstallation looks the owner up, reloading the installation list at most
 // once a minute. An empty owner picks the lowest installation id.
 func (a *App) findInstallation(ctx context.Context, owner string) (installation, error) {
-	if a.installs == nil || (a.find(owner) == nil && a.now().Sub(a.loadedAt) > time.Minute) {
-		jwt, err := a.jwt()
-		if err != nil {
+	a.mu.Lock()
+	loaded, age := a.installs != nil, a.now().Sub(a.loadedAt)
+	i := a.find(owner)
+	a.mu.Unlock()
+	if !loaded || (i == nil && age > time.Minute) {
+		v, _ := a.flights.Do("installs", func() any { return a.loadInstallations(ctx) })
+		if err, _ := v.(error); err != nil {
 			return installation{}, err
 		}
-		var all []installation
-		for page := 1; page <= 20; page++ {
-			var out []struct {
-				ID      int64 `json:"id"`
-				Account struct {
-					Login string `json:"login"`
-				} `json:"account"`
-			}
-			if err := a.call(ctx, http.MethodGet, fmt.Sprintf("/app/installations?per_page=100&page=%d", page), jwt, &out); err != nil {
-				return installation{}, err
-			}
-			for _, o := range out {
-				all = append(all, installation{o.ID, o.Account.Login})
-			}
-			if len(out) < 100 {
-				break
-			}
-		}
-		sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
-		a.installs, a.loadedAt = all, a.now()
+		a.mu.Lock()
+		i = a.find(owner)
+		a.mu.Unlock()
 	}
-	if i := a.find(owner); i != nil {
+	if i != nil {
 		return *i, nil
 	}
 	return installation{}, ErrNoInstallation
 }
 
+func (a *App) loadInstallations(ctx context.Context) any {
+	jwt, err := a.jwt()
+	if err != nil {
+		return err
+	}
+	all := []installation{}
+	for page := 1; page <= 20; page++ {
+		var out []struct {
+			ID      int64 `json:"id"`
+			Account struct {
+				Login string `json:"login"`
+			} `json:"account"`
+		}
+		if err := a.call(ctx, http.MethodGet, fmt.Sprintf("/app/installations?per_page=100&page=%d", page), jwt, &out); err != nil {
+			return err
+		}
+		for _, o := range out {
+			all = append(all, installation{o.ID, o.Account.Login})
+		}
+		if len(out) < 100 {
+			break
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].id < all[j].id })
+	a.mu.Lock()
+	a.installs, a.loadedAt = all, a.now()
+	a.mu.Unlock()
+	return nil
+}
+
+// find must be called with a.mu held.
 func (a *App) find(owner string) *installation {
 	for i := range a.installs {
 		if owner == "" || strings.EqualFold(a.installs[i].login, owner) {
@@ -151,6 +200,8 @@ func (a *App) call(ctx context.Context, method, path, jwt string, out any) error
 }
 
 func (a *App) loadKey() (*rsa.PrivateKey, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	if a.key != nil {
 		return a.key, nil
 	}
@@ -185,7 +236,9 @@ func (a *App) jwt() (string, error) {
 		return "", err
 	}
 	enc := base64.RawURLEncoding
+	a.mu.Lock()
 	now := a.now()
+	a.mu.Unlock()
 	hdr, _ := json.Marshal(map[string]string{"alg": "RS256", "typ": "JWT"})
 	pl, _ := json.Marshal(map[string]any{"iat": now.Add(-time.Minute).Unix(), "exp": now.Add(9 * time.Minute).Unix(), "iss": a.id})
 	msg := enc.EncodeToString(hdr) + "." + enc.EncodeToString(pl)

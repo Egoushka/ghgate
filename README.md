@@ -26,19 +26,33 @@ Scope the proxy to GitHub traffic only.
 - **gh**: a wrapper earlier on `PATH` than the real `gh`:
   ```sh
   #!/bin/sh
-  export HTTPS_PROXY=http://127.0.0.1:8899 SSL_CERT_FILE=/path/to/bundle.pem GH_TOKEN=<client token>
+  export HTTPS_PROXY=http://x:<client token>@127.0.0.1:8899 SSL_CERT_FILE=/path/to/bundle.pem GH_TOKEN=<client token>
   exec /usr/bin/gh "$@"
   ```
 - **git**, per URL, so other remotes are untouched:
   ```sh
-  git config --global http.https://github.com/.proxy http://127.0.0.1:8899
+  git config --global http.https://github.com/.proxy http://x:<client token>@127.0.0.1:8899
   git config --global http.https://github.com/.sslCAInfo /path/to/bundle.pem
   ```
   Give git the client token as the Basic password (a credential helper, or `https://x:<client token>@github.com/...`).
-- **github-mcp**: set the same `HTTPS_PROXY`, `SSL_CERT_FILE` and `GITHUB_PERSONAL_ACCESS_TOKEN=<client token>` in its
+- **github-mcp**: set the same `HTTPS_PROXY` (with the token in it), `SSL_CERT_FILE` and `GITHUB_PERSONAL_ACCESS_TOKEN=<client token>` in its
   environment (or on its container).
 
 A client token is checked against the SHA-256 stored in the config, then replaced by the real credential upstream.
+
+**The token goes in the proxy URL too.** `CONNECT` itself needs the client token as `Proxy-Authorization`, or ghgate answers
+`407`. Checked: Go's `net/http` (so `gh`) sends the userinfo of `HTTPS_PROXY=http://x:TOKEN@host:port` as a Basic
+`Proxy-Authorization` on the first `CONNECT`; git (libcurl) sends none at first, gets the `407` with
+`Proxy-Authenticate: Basic`, and retries on the same connection with it (git 2.39.5). Inside the tunnel the usual
+`Authorization` check still applies.
+
+**Tunnelling other hosts** is off by default (`tunnel_others`). When on, it refuses loopback, private, link-local, CGNAT
+and other internal destinations, and the admin listener.
+
+**GitHub App mode.** A request with an owner in the path (`/repos/o/...`, `/orgs/o`, `/users/o`) uses that owner's
+installation. A request without one (GraphQL, `/user`) uses the installation with the lowest id. GraphQL answers a
+repository the installation cannot see with `200` and partial data, not a 404, so the write-credential retry does not
+cover it: query GraphQL with a PAT, or accept the gaps.
 
 ## How it differs
 

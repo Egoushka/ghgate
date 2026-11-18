@@ -2,7 +2,9 @@
 package route
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
 	"strings"
 )
 
@@ -32,30 +34,46 @@ func Classify(method, path string, body []byte) Kind {
 }
 
 // GraphQLHasMutation reports whether a GraphQL request body may run a mutation.
-// It is true whenever the body cannot be positively shown to hold only queries.
+// It is true whenever the body cannot be positively shown to hold only queries:
+// batches, duplicate keys, keys other than exactly query, variables and
+// operationName (Go's json package would match them case-insensitively, GitHub
+// may not), and anything that does not parse.
 func GraphQLHasMutation(body []byte) bool {
-	t := strings.TrimLeft(strings.TrimPrefix(string(body), "\xef\xbb\xbf"), " \t\r\n")
-	if strings.HasPrefix(t, "[") {
-		var batch []struct {
-			Query string `json:"query"`
-		}
-		if json.Unmarshal(body, &batch) != nil || len(batch) == 0 {
-			return true
-		}
-		for _, b := range batch {
-			if DocumentHasMutation(b.Query) {
-				return true
-			}
-		}
-		return false
-	}
-	var one struct {
-		Query string `json:"query"`
-	}
-	if json.Unmarshal(body, &one) != nil {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return true
 	}
-	return DocumentHasMutation(one.Query)
+	seen := map[string]bool{}
+	query, haveQuery := "", false
+	for dec.More() {
+		kt, err := dec.Token()
+		key, ok := kt.(string)
+		if err != nil || !ok || seen[key] {
+			return true
+		}
+		seen[key] = true
+		var raw json.RawMessage
+		if dec.Decode(&raw) != nil {
+			return true
+		}
+		switch key {
+		case "query":
+			if json.Unmarshal(raw, &query) != nil {
+				return true
+			}
+			haveQuery = true
+		case "variables", "operationName":
+		default:
+			return true
+		}
+	}
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
+		return true
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return true
+	}
+	return !haveQuery || DocumentHasMutation(query)
 }
 
 // DocumentHasMutation scans a GraphQL document and reports whether any

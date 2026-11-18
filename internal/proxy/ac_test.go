@@ -110,8 +110,15 @@ func TestAC2_ConcurrentIdenticalGetsShareOneUpstreamCall(t *testing.T) {
 	}
 }
 
+func omitRead(c *config.Config) { c.Read = nil }
+
 func TestAC3_CredentialSplitAndClientTokenNeverUpstream(t *testing.T) {
-	h := newHarness(t, nil)
+	t.Run("separate", func(t *testing.T) { ac3(t, nil, patRead) })
+	t.Run("read omitted", func(t *testing.T) { ac3(t, omitRead, patWrite) })
+}
+
+func ac3(t *testing.T, mod func(*config.Config), readTok string) {
+	h := newHarness(t, mod)
 	c := h.client()
 	api := "https://api.github.com"
 	h.do(c, clientWrite, "GET", api+"/repos/o/r", "")
@@ -121,8 +128,8 @@ func TestAC3_CredentialSplitAndClientTokenNeverUpstream(t *testing.T) {
 	h.do(c, clientWrite, "DELETE", api+"/repos/o/r/issues/1/labels/bug", "")
 	h.do(c, clientWrite, "POST", api+"/graphql", "# c\n"+`{"query":"# hi\nmutation M { addStar(input:{starrableId:\"1\"}) { clientMutationId } }"}`)
 	want := []struct{ method, path, tok string }{
-		{"GET", "/repos/o/r", patRead},
-		{"POST", "/graphql", patRead},
+		{"GET", "/repos/o/r", readTok},
+		{"POST", "/graphql", readTok},
 		{"POST", "/repos/o/r/issues", patWrite},
 		{"PATCH", "/repos/o/r/issues/1", patWrite},
 		{"DELETE", "/repos/o/r/issues/1/labels/bug", patWrite},
@@ -148,7 +155,12 @@ func TestAC3_CredentialSplitAndClientTokenNeverUpstream(t *testing.T) {
 }
 
 func TestAC4_ClientIdentityAndCanWrite(t *testing.T) {
-	h := newHarness(t, nil)
+	t.Run("separate", func(t *testing.T) { ac4(t, nil) })
+	t.Run("read omitted", func(t *testing.T) { ac4(t, omitRead) })
+}
+
+func ac4(t *testing.T, mod func(*config.Config)) {
+	h := newHarness(t, mod)
 	c := h.client()
 	api := "https://api.github.com"
 	for _, tok := range []string{"", "not-a-configured-token"} {
@@ -181,6 +193,11 @@ func TestAC4_ClientIdentityAndCanWrite(t *testing.T) {
 	}
 	if h.api.count() != 0 {
 		t.Fatalf("refused writes reached upstream: %d", h.api.count())
+	}
+	// A GraphQL query is a read for a read-only client only when a separate read credential exists.
+	resp, _ = h.do(c, clientRead, "POST", api+"/graphql", `{"query":"{ viewer { login } }"}`)
+	if mod == nil && resp.StatusCode != 200 || mod != nil && resp.StatusCode != 403 {
+		t.Fatalf("graphql query by a read-only client: %d (read omitted: %v)", resp.StatusCode, mod != nil)
 	}
 	// Basic auth with the right token works
 	req, _ = http.NewRequest("GET", api+"/repos/o/r", nil)
@@ -268,6 +285,13 @@ func TestAC7_ReadNotFoundRetriesOnceWithWrite(t *testing.T) {
 		io.WriteString(w, "private-data")
 	}
 	resp, body := h.get(clientRead, "/repos/o/private")
+	if resp.StatusCode != 404 || h.api.count() != 1 {
+		t.Fatalf("a client without can_write must not get the write-credential retry: %d, %d requests", resp.StatusCode, h.api.count())
+	}
+	h.api.mu.Lock()
+	h.api.reqs = nil
+	h.api.mu.Unlock()
+	resp, body = h.get(clientWrite, "/repos/o/private")
 	if resp.StatusCode != 200 || body != "private-data" {
 		t.Fatalf("%d %q", resp.StatusCode, body)
 	}
@@ -277,17 +301,19 @@ func TestAC7_ReadNotFoundRetriesOnceWithWrite(t *testing.T) {
 	}
 	// a 404 from both stays a 404, still one retry
 	h.api.fn = func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(404) }
-	resp, _ = h.get(clientRead, "/repos/o/nothing")
+	resp, _ = h.get(clientWrite, "/repos/o/nothing")
 	if resp.StatusCode != 404 || h.api.count() != 4 {
 		t.Fatalf("both 404: %d, %d requests", resp.StatusCode, h.api.count())
 	}
 }
 
 func TestAC8_ConnectToOtherHostIsTunnelled(t *testing.T) {
-	h := newHarness(t, nil)
+	on := true
+	h := newHarnessOpt(t, func(c *config.Config) { c.TunnelOthers = &on }, func(o *Options) { o.AllowPrivateTunnel = true })
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, "origin-says-hi") }))
 	defer origin.Close()
 	pu, _ := url.Parse(h.proxy.URL)
+	pu.User = url.UserPassword("x", clientRead)
 	c := &http.Client{Transport: &http.Transport{
 		Proxy:           http.ProxyURL(pu),
 		TLSClientConfig: &tls.Config{RootCAs: certPool(origin.Certificate())}, // trusts the origin only, not ghgate's CA
@@ -302,9 +328,9 @@ func TestAC8_ConnectToOtherHostIsTunnelled(t *testing.T) {
 		t.Fatalf("not the origin's own certificate: %q", b)
 	}
 	// and refused when tunnelling is off
-	off := false
-	h2 := newHarness(t, func(c *config.Config) { c.TunnelOthers = &off })
+	h2 := newHarness(t, nil) // tunnel_others defaults to false
 	pu2, _ := url.Parse(h2.proxy.URL)
+	pu2.User = url.UserPassword("x", clientRead)
 	c2 := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(pu2), TLSClientConfig: &tls.Config{RootCAs: certPool(origin.Certificate())}}}
 	if resp, err := c2.Get(origin.URL); err == nil {
 		resp.Body.Close()
@@ -381,7 +407,10 @@ func TestAC11_ProxyUsesPerOwnerAppTokens(t *testing.T) {
 		t.Fatalf("mint counts %v", mints)
 	}
 	// an owner without the app falls back to the write credential
-	resp, _ := h.get(clientRead, "/repos/nobody/x")
+	if resp, _ := h.get(clientRead, "/repos/nobody/x"); resp.StatusCode != 404 {
+		t.Fatalf("read-only client must not fall back to the write credential: %d", resp.StatusCode)
+	}
+	resp, _ := h.get(clientWrite, "/repos/nobody/x")
 	if resp.StatusCode != 200 {
 		t.Fatalf("fallback status %d", resp.StatusCode)
 	}

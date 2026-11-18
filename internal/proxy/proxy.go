@@ -14,8 +14,11 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/Egoushka/ghgate/internal/ca"
@@ -29,6 +32,9 @@ type Options struct {
 	Logger *slog.Logger
 	// Transport overrides the upstream round tripper (tests trust httptest certificates this way).
 	Transport http.RoundTripper
+	// AllowPrivateTunnel lets CONNECT tunnels reach loopback and private
+	// addresses. Tests only: it is not a config option. The admin listener stays refused.
+	AllowPrivateTunnel bool
 }
 
 type target struct {
@@ -43,21 +49,27 @@ type client struct {
 }
 
 type Server struct {
-	cfg       *config.Config
-	ca        *ca.CA
-	cache     *cache.Cache
-	flights   cache.Group
-	floor     *floor.Tracker
-	read      creds.Source
-	write     creds.Source
-	sameCred  bool
-	hc        *http.Client
-	log       *slog.Logger
-	stats     *Stats
-	clients   []client
-	intercept map[string]target
-	maxEntry  int64
-	fresh     time.Duration
+	cfg        *config.Config
+	ca         *ca.CA
+	cache      *cache.Cache
+	flights    cache.Group
+	floor      *floor.Tracker
+	read       creds.Source
+	write      creds.Source
+	sameCred   bool
+	hc         *http.Client
+	log        *slog.Logger
+	stats      *Stats
+	clients    []client
+	intercept  map[string]target
+	maxEntry   int64
+	fresh      time.Duration
+	dialer     *net.Dialer
+	tunnelIdle time.Duration
+	bufSem     chan struct{}
+	bufNow     atomic.Int64
+	bufPeak    atomic.Int64
+	resByPath  sync.Map // first path segment -> rate-limit resource the upstream reported
 }
 
 func New(cfg *config.Config, opt Options) (*Server, error) {
@@ -101,6 +113,9 @@ func New(cfg *config.Config, opt Options) (*Server, error) {
 		hc: hc, log: log, stats: newStats(), intercept: map[string]target{},
 		maxEntry: int64(cfg.MaxEntryMB) << 20, fresh: time.Duration(cfg.FreshForMS) * time.Millisecond,
 	}
+	s.tunnelIdle = defaultTunnelIdle
+	s.bufSem = make(chan struct{}, cfg.MaxBuffers)
+	s.dialer = &net.Dialer{Timeout: 15 * time.Second, Control: tunnelControl(cfg.Admin, opt.AllowPrivateTunnel)}
 	for _, h := range cfg.InterceptHosts {
 		switch {
 		case h == "api.github.com":
@@ -141,6 +156,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "ghgate is a CONNECT-only proxy", http.StatusMethodNotAllowed)
 		return
 	}
+	if _, ok := s.authenticateValue(r.Header.Get("Proxy-Authorization")); !ok {
+		w.Header().Set("Proxy-Authenticate", `Basic realm="ghgate"`)
+		http.Error(w, "ghgate: proxy authentication required (send the client token in Proxy-Authorization)", http.StatusProxyAuthRequired)
+		return
+	}
 	host, port, err := net.SplitHostPort(r.Host)
 	if err != nil {
 		http.Error(w, "bad CONNECT authority", http.StatusBadRequest)
@@ -160,7 +180,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var upstream net.Conn
 	if !intercepted {
-		upstream, err = net.DialTimeout("tcp", r.Host, 15*time.Second)
+		upstream, err = s.dialer.DialContext(r.Context(), "tcp", r.Host)
 		if err != nil {
 			http.Error(w, "cannot reach host", http.StatusBadGateway)
 			return
@@ -182,7 +202,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	cc := &bufConn{Conn: conn, r: rw.Reader}
 	if !intercepted {
-		tunnel(cc, upstream)
+		tunnel(cc, upstream, s.tunnelIdle)
 		return
 	}
 	s.mitm(cc, host, t)
@@ -195,7 +215,34 @@ type bufConn struct {
 
 func (b *bufConn) Read(p []byte) (int, error) { return b.r.Read(p) }
 
-func tunnel(a, b net.Conn) {
+// defaultTunnelIdle closes a tunnel that carries no bytes for this long.
+const defaultTunnelIdle = 5 * time.Minute
+
+// idleConn pushes its deadline forward on every successful read or write.
+type idleConn struct {
+	net.Conn
+	idle time.Duration
+}
+
+func (c idleConn) Read(p []byte) (int, error) {
+	c.Conn.SetDeadline(time.Now().Add(c.idle))
+	return c.Conn.Read(p)
+}
+
+func (c idleConn) Write(p []byte) (int, error) {
+	c.Conn.SetDeadline(time.Now().Add(c.idle))
+	return c.Conn.Write(p)
+}
+
+func (c idleConn) CloseWrite() error {
+	if cw, ok := c.Conn.(interface{ CloseWrite() error }); ok {
+		return cw.CloseWrite()
+	}
+	return c.Conn.Close()
+}
+
+func tunnel(a, b net.Conn, idle time.Duration) {
+	a, b = idleConn{a, idle}, idleConn{b, idle}
 	var wg sync.WaitGroup
 	cp := func(dst, src net.Conn) {
 		defer wg.Done()
@@ -277,7 +324,12 @@ func (l *oneConnListener) Addr() net.Addr { return &net.TCPAddr{} }
 
 // authenticate maps the request's token to a configured client.
 func (s *Server) authenticate(r *http.Request) (*client, bool) {
-	scheme, val, ok := strings.Cut(strings.TrimSpace(r.Header.Get("Authorization")), " ")
+	return s.authenticateValue(r.Header.Get("Authorization"))
+}
+
+// authenticateValue accepts an Authorization or Proxy-Authorization value.
+func (s *Server) authenticateValue(v string) (*client, bool) {
+	scheme, val, ok := strings.Cut(strings.TrimSpace(v), " ")
 	if !ok {
 		return nil, false
 	}
@@ -287,7 +339,7 @@ func (s *Server) authenticate(r *http.Request) (*client, bool) {
 	case "token", "bearer":
 		tok = val
 	case "basic":
-		u, p, ok := r.BasicAuth()
+		u, p, ok := (&http.Request{Header: http.Header{"Authorization": {"Basic " + val}}}).BasicAuth()
 		if !ok {
 			return nil, false
 		}
@@ -324,4 +376,53 @@ func (s *Server) AdminHandler() http.Handler {
 		})
 	})
 	return mux
+}
+
+var blockedNets = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{"0.0.0.0/8", "100.64.0.0/10", "192.0.0.0/24", "198.18.0.0/15"} {
+		_, n, _ := net.ParseCIDR(c)
+		out = append(out, n)
+	}
+	return out
+}()
+
+func blockedIP(ip net.IP) bool {
+	if a, ok := netip.AddrFromSlice(ip); ok {
+		ip = net.IP(a.Unmap().AsSlice())
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	for _, n := range blockedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// tunnelControl runs after name resolution, on the address about to be dialled,
+// so a hostname that resolves (or rebinds) to an internal address is refused.
+func tunnelControl(admin string, allowPrivate bool) func(network, address string, _ syscall.RawConn) error {
+	ah, ap, _ := net.SplitHostPort(admin)
+	aip := net.ParseIP(ah)
+	return func(network, address string, _ syscall.RawConn) error {
+		h, p, err := net.SplitHostPort(address)
+		if err != nil {
+			return err
+		}
+		ip := net.ParseIP(h)
+		if ip == nil {
+			return errors.New("destination is not an IP")
+		}
+		if p == ap && (aip == nil || aip.IsUnspecified() || aip.Equal(ip)) {
+			return errors.New("the admin listener is not a valid destination")
+		}
+		if !allowPrivate && blockedIP(ip) {
+			return errors.New("destination address is not allowed")
+		}
+		return nil
+	}
 }

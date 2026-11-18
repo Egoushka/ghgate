@@ -3,7 +3,7 @@
   "admin": "127.0.0.1:8898",
   "state_dir": "state",
   "intercept_hosts": ["api.github.com", "github.com"],
-  "tunnel_others": true,
+  "tunnel_others": false,
   "clients": [
     {"name": "agent-readonly", "token_sha256": "<output of: printf %s TOKEN | ghgate hash-token>", "can_write": false},
     {"name": "agent-writer", "token_sha256": "<another sha256>", "can_write": true}
@@ -12,6 +12,7 @@
   "write": {"pat_file": "/etc/ghgate/pat"},
   "cache_mb": 256,
   "max_entry_mb": 8,
+  "max_inflight_buffers": 64,
   "fresh_for_ms": 0,
   "floor": 300,
   "write_floor": 50

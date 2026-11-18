@@ -37,6 +37,7 @@ type Config struct {
 	Write          *Cred    `json:"write"`
 	CacheMB        int      `json:"cache_mb"`
 	MaxEntryMB     int      `json:"max_entry_mb"`
+	MaxBuffers     int      `json:"max_inflight_buffers"`
 	FreshForMS     int      `json:"fresh_for_ms"`
 	Floor          int      `json:"floor"`
 	WriteFloor     int      `json:"write_floor"`
@@ -46,7 +47,7 @@ type Config struct {
 	UpstreamWeb string `json:"upstream_web"`
 }
 
-func (c *Config) TunnelOthersOn() bool { return c.TunnelOthers == nil || *c.TunnelOthers }
+func (c *Config) TunnelOthersOn() bool { return c.TunnelOthers != nil && *c.TunnelOthers }
 
 func Load(path string) (*Config, error) {
 	b, err := os.ReadFile(path)
@@ -87,6 +88,9 @@ func (c *Config) Normalize() error {
 	}
 	if c.MaxEntryMB <= 0 {
 		c.MaxEntryMB = 8
+	}
+	if c.MaxBuffers <= 0 {
+		c.MaxBuffers = 64
 	}
 	if c.Floor == 0 {
 		c.Floor = 300

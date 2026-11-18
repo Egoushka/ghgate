@@ -5,11 +5,11 @@
 #   GHGATE_CLIENT_TOKEN=<client token>   a client token from that config
 #   REAL_PAT_FILE=/path/to/pat           the same PAT the proxy uses, to read core.used directly
 #   PRIVATE_REPO=owner/name              a private repo the PAT can read
-#   GHGATE_PROXY=http://127.0.0.1:8899   optional
+#   GHGATE_PROXY_ADDR=127.0.0.1:8899     optional
 set -euo pipefail
 
 : "${GHGATE_CONFIG:?}" "${GHGATE_CLIENT_TOKEN:?}" "${REAL_PAT_FILE:?}" "${PRIVATE_REPO:?}"
-proxy="${GHGATE_PROXY:-http://127.0.0.1:8899}"
+proxy="http://x:${GHGATE_CLIENT_TOKEN}@${GHGATE_PROXY_ADDR:-127.0.0.1:8899}" # CONNECT needs the token as Proxy-Authorization
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 

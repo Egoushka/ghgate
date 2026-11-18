@@ -126,3 +126,61 @@ func TestAC12_PATReloadsOnMtimeChange(t *testing.T) {
 		t.Fatal("rotation not picked up")
 	}
 }
+
+func TestAppMintDoesNotBlockOtherOwnersAndIsShared(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	keyFile := filepath.Join(t.TempDir(), "app.pem")
+	os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600)
+	var mu sync.Mutex
+	mints := map[string]int{}
+	slow := make(chan struct{})
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/app/installations":
+			fmt.Fprint(w, `[{"id":1,"account":{"login":"acme"}},{"id":2,"account":{"login":"globex"}}]`)
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			id := strings.Split(r.URL.Path, "/")[3]
+			mu.Lock()
+			mints[id]++
+			mu.Unlock()
+			if id == "1" {
+				<-slow
+			}
+			fmt.Fprintf(w, `{"token":"tok-%s","expires_at":%q}`, id, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		}
+	}))
+	defer srv.Close()
+	a := NewApp(1, keyFile, srv.URL, srv.Client())
+	ctx := context.Background()
+	if tk, _, err := a.Token(ctx, "globex"); err != nil || tk != "tok-2" {
+		t.Fatal(tk, err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ { // ten callers for a slow owner share one mint
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if tk, _, err := a.Token(ctx, "acme"); err != nil || tk != "tok-1" {
+				t.Error(tk, err)
+			}
+		}()
+	}
+	time.Sleep(200 * time.Millisecond)
+	done := make(chan string, 1)
+	go func() { tk, _, _ := a.Token(ctx, "globex"); done <- tk }()
+	select {
+	case tk := <-done:
+		if tk != "tok-2" {
+			t.Fatal(tk)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a cached owner's token is blocked behind another owner's slow mint")
+	}
+	close(slow)
+	wg.Wait()
+	mu.Lock()
+	defer mu.Unlock()
+	if mints["1"] != 1 || mints["2"] != 1 {
+		t.Fatalf("mints %v", mints)
+	}
+}

@@ -91,6 +91,11 @@ func hashOf(t *testing.T, tok string) string {
 
 func newHarness(t *testing.T, mod func(*config.Config)) *harness {
 	t.Helper()
+	return newHarnessOpt(t, mod, nil)
+}
+
+func newHarnessOpt(t *testing.T, mod func(*config.Config), opt func(*Options)) *harness {
+	t.Helper()
 	h := &harness{t: t, api: newUpstream(t), web: newUpstream(t), logs: &syncBuf{}, dir: t.TempDir()}
 	h.readFile = filepath.Join(h.dir, "read.pat")
 	h.writeFile = filepath.Join(h.dir, "write.pat")
@@ -113,7 +118,11 @@ func newHarness(t *testing.T, mod func(*config.Config)) *harness {
 	if err := cfg.Normalize(); err != nil {
 		t.Fatal(err)
 	}
-	s, err := New(cfg, Options{Logger: slog.New(slog.NewJSONHandler(h.logs, nil)), Transport: h.api.Client().Transport})
+	o := Options{Logger: slog.New(slog.NewJSONHandler(h.logs, nil)), Transport: h.api.Client().Transport}
+	if opt != nil {
+		opt(&o)
+	}
+	s, err := New(cfg, o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,8 +133,14 @@ func newHarness(t *testing.T, mod func(*config.Config)) *harness {
 }
 
 // client is what an agent looks like: an HTTP client behind the proxy trusting only ghgate's CA.
-func (h *harness) client() *http.Client {
+func (h *harness) client() *http.Client { return h.clientAs(clientWrite) }
+
+// clientAs sends the token to the proxy as Proxy-Authorization, the way HTTPS_PROXY=http://x:TOKEN@host does.
+func (h *harness) clientAs(proxyTok string) *http.Client {
 	pu, _ := url.Parse(h.proxy.URL)
+	if proxyTok != "" {
+		pu.User = url.UserPassword("x", proxyTok)
+	}
 	return &http.Client{
 		Timeout: 20 * time.Second,
 		Transport: &http.Transport{
