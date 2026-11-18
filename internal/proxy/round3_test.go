@@ -61,14 +61,20 @@ func TestDefaultOwnerServesRequestsWithoutAnOwner(t *testing.T) {
 	}
 }
 
-func TestNoDefaultOwnerFallsBackToTheWriteCredential(t *testing.T) {
+func TestNoDefaultOwnerFallsBackToTheWriteCredentialOnlyForWriters(t *testing.T) {
 	h := appHarness(t, "")
 	c := h.client()
-	// a read-only client may GET, with the write credential (same as when read is omitted)
-	if resp, _ := h.get(clientRead, "/user"); resp.StatusCode != 200 || lastAuth(h) != "Bearer "+patWrite {
-		t.Fatalf("ownerless GET: %d %q", resp.StatusCode, lastAuth(h))
-	}
+	// a read-only client never gets an answer fetched with the write credential (gate r3)
 	n := h.api.count()
+	for _, p := range []string{"/user", "/repositories/42/contents/secret", "/search/code?q=repo:acme/private+secret"} {
+		if resp, _ := h.get(clientRead, p); resp.StatusCode != 403 || h.api.count() != n {
+			t.Fatalf("ownerless GET %s by a read-only client must be refused before upstream: %d", p, resp.StatusCode)
+		}
+	}
+	if resp, _ := h.get(clientWrite, "/user"); resp.StatusCode != 200 || lastAuth(h) != "Bearer "+patWrite {
+		t.Fatalf("ownerless GET by a writer: %d %q", resp.StatusCode, lastAuth(h))
+	}
+	n = h.api.count()
 	q := `{"query":"{ viewer { login } }"}`
 	if resp, _ := h.do(c, clientRead, "POST", apiURL+"/graphql", q); resp.StatusCode != 403 || h.api.count() != n {
 		t.Fatalf("graphql by a read-only client must be refused: %d", resp.StatusCode)

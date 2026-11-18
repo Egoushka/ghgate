@@ -130,10 +130,17 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 	kind := route.Classify(r.Method, r.URL.Path, body)
 	owner := s.ownerFor(r.URL.Path)
 	viaWrite := s.readViaWrite(owner)
-	if gql && (s.sameCred || viaWrite) && !cl.canWrite {
+	if gql && s.sameCred && !cl.canWrite {
 		// The write credential does the read too, so a GraphQL document the
 		// parser calls a query still runs with it.
-		s.refuse(w, rc, http.StatusForbidden, "ghgate: this client token cannot write, and GraphQL runs with the write credential here (no separate read credential, or no default_owner for an App read credential)")
+		s.refuse(w, rc, http.StatusForbidden, "ghgate: this client token cannot write, and GraphQL runs with the write credential here (no separate read credential)")
+		rc.outcome = "bypass"
+		return
+	}
+	if viaWrite && !cl.canWrite {
+		// No owner and no default_owner: only the write credential could answer, and a read-only
+		// client never gets an answer fetched with it (THREAT-MODEL, cross-identity row).
+		s.refuse(w, rc, http.StatusForbidden, "ghgate: this request names no owner and no default_owner is set, so only the write credential could answer it, which this client token may not use; set default_owner, or use an owner-scoped path such as /repos/{owner}/{repo}/...")
 		rc.outcome = "bypass"
 		return
 	}
@@ -560,7 +567,7 @@ func (s *Server) ownerFor(path string) string {
 }
 
 // readViaWrite: with an App read credential, a request that names no owner has no installation to use,
-// so it is read with the write credential (and then the can_write rules apply).
+// so it is read with the write credential, for clients with can_write only.
 func (s *Server) readViaWrite(owner string) bool {
 	return owner == "" && !s.sameCred && s.cfg.Read.App != nil
 }

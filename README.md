@@ -54,8 +54,8 @@ and other internal destinations, and the admin listener.
 
 **GitHub App mode.** A request with an owner in the path (`/repos/o/...`, `/orgs/o`, `/users/o`) uses that owner's
 installation. A request without one (GraphQL, `/user`, `/repositories/N`) uses the installation of `default_owner` when
-you set it. Otherwise it is read with the `write` credential: plain `GET`s for any client, GraphQL only for clients with
-`can_write`. GraphQL answers a repository the installation cannot see with `200` and partial data, not a 404, so the
+you set it. Otherwise only clients with `can_write` get it, read with the `write` credential; a read-only client gets `403` before
+anything goes upstream. GraphQL answers a repository the installation cannot see with `200` and partial data, not a 404, so the
 write-credential retry does not cover it.
 
 **Read-only clients and git.** A client without `can_write` gets git upload-pack on `github.com` and nothing else there:

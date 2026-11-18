@@ -56,7 +56,7 @@ Rules:
 
 When `read` is omitted, it falls back to `write`; every GraphQL POST then needs `can_write`, because it runs with the write credential. Two entries are one credential when they name the same `pat_file` (after resolving symlinks) or the same App id.
 
-**App mode and the owner.** A request names an owner in the path (`/repos/o/...`, `/orgs/o`, `/users/o`). One without (GraphQL, `/user`, `/repositories/N`) uses the installation of `default_owner` when that is set. Otherwise it is read with the `write` credential: plain `GET`s as for any client, GraphQL only for clients with `can_write`. There is no "first installation" guess. GraphQL answers a repository the installation cannot see with `200` and partial data, so the 404/403 retry does not cover it. A failed `/app/installations` load is not retried for 60 s.
+**App mode and the owner.** A request names an owner in the path (`/repos/o/...`, `/orgs/o`, `/users/o`). One without (GraphQL, `/user`, `/repositories/N`) uses the installation of `default_owner` when that is set. Otherwise only clients with `can_write` get it, read with the `write` credential; a read-only client gets `403` before anything goes upstream (gate r3). There is no "first installation" guess. GraphQL answers a repository the installation cannot see with `200` and partial data, so the 404/403 retry does not cover it. A failed `/app/installations` load is not retried for 60 s.
 
 **Routing.**
 

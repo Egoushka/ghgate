@@ -104,6 +104,9 @@ func TestOldSingleCALayoutIsRefused(t *testing.T) {
 func TestOpenSSLHonoursPerHostConstraints(t *testing.T) {
 	ossl, err := exec.LookPath("openssl")
 	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("openssl is required in CI: the docs claim OpenSSL honours the constraints")
+		}
 		t.Skip("openssl not installed")
 	}
 	set, _ := newSet(t)
