@@ -2,7 +2,6 @@ package creds
 
 import (
 	"bytes"
-	"io"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -15,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Egoushka/ghgate/internal/cache"
+	"io"
 	"net/http"
 	"os"
 	"sort"
@@ -397,4 +397,53 @@ func (a *App) cachedKey(key string) (string, time.Time, bool) {
 		return t.tok, t.expires, true
 	}
 	return "", time.Time{}, false
+}
+
+// Inspection is what GitHub says about one owner's installation of this App: nothing secret.
+type Inspection struct {
+	Owner       string            `json:"owner"`
+	Selection   string            `json:"repository_selection"`
+	Permissions map[string]string `json:"permissions"`
+	Repos       []string          `json:"repositories"`
+}
+
+// Inspect mints a fresh installation token for owner (never cached) and reports the installation's permissions and
+// the repositories the token can see. The token itself is not returned.
+func (a *App) Inspect(ctx context.Context, owner string) (Inspection, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	inst, err := a.findInstallation(ctx, owner)
+	if err != nil {
+		return Inspection{}, err
+	}
+	jwt, err := a.jwt()
+	if err != nil {
+		return Inspection{}, err
+	}
+	var tok struct {
+		Token     string            `json:"token"`
+		Selection string            `json:"repository_selection"`
+		Perms     map[string]string `json:"permissions"`
+	}
+	if err := a.call(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", inst.id), jwt, &tok); err != nil {
+		return Inspection{}, err
+	}
+	out := Inspection{Owner: inst.login, Selection: tok.Selection, Permissions: tok.Perms, Repos: []string{}}
+	for page := 1; page <= 10; page++ {
+		var rs struct {
+			Repositories []struct {
+				FullName string `json:"full_name"`
+			} `json:"repositories"`
+		}
+		if err := a.call(ctx, http.MethodGet, fmt.Sprintf("/installation/repositories?per_page=100&page=%d", page), tok.Token, &rs); err != nil {
+			return Inspection{}, err
+		}
+		for _, r := range rs.Repositories {
+			out.Repos = append(out.Repos, r.FullName)
+		}
+		if len(rs.Repositories) < 100 {
+			break
+		}
+	}
+	return out, nil
 }

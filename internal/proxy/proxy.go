@@ -5,6 +5,7 @@ package proxy
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -413,6 +414,24 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("GET /ca.pem", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-pem-file")
 		w.Write(s.ca.CertPEM())
+	})
+	// GET /installations/{cred}/{owner}: what the App behind a credential (read, write or scoped_write) is installed
+	// on for an owner: permissions and repositories, never a token. Tailnet-only like /stats.
+	mux.HandleFunc("GET /installations/{cred}/{owner}", func(w http.ResponseWriter, r *http.Request) {
+		src := map[string]creds.Source{"read": s.read, "write": s.write, "scoped_write": s.scopedW}[r.PathValue("cred")]
+		in, ok := src.(interface {
+			Inspect(context.Context, string) (creds.Inspection, error)
+		})
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "no such credential, or it is not a GitHub App"})
+			return
+		}
+		out, err := in.Inspect(r.Context(), r.PathValue("owner"))
+		if err != nil {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
 	})
 	mux.HandleFunc("GET /stats", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
