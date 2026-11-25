@@ -44,6 +44,9 @@ type Config struct {
 	Clients        []Client `json:"clients"`
 	Read           *Cred    `json:"read"`
 	Write          *Cred    `json:"write"`
+	// ScopedWrite is the App credential for clients that carry repos or perms; the rest use Write (a PAT may stay
+	// there for clients that need user-scoped endpoints). Omitted: those clients use Write too.
+	ScopedWrite *Cred `json:"scoped_write"`
 	CacheMB        int      `json:"cache_mb"`
 	MaxEntryMB     int      `json:"max_entry_mb"`
 	MaxBuffers     int      `json:"max_inflight_buffers"`
@@ -118,10 +121,21 @@ func (c *Config) Normalize() error {
 	if c.Read == nil {
 		c.Read = c.Write
 	}
-	for _, cr := range []*Cred{c.Read, c.Write} {
+	creds := []*Cred{c.Read, c.Write}
+	if c.ScopedWrite != nil {
+		creds = append(creds, c.ScopedWrite)
+		if c.ScopedWrite.App == nil {
+			return errors.New("config: scoped_write must be an app")
+		}
+	}
+	for _, cr := range creds {
 		if err := cr.validate(); err != nil {
 			return err
 		}
+	}
+	scoped := c.Write
+	if c.ScopedWrite != nil {
+		scoped = c.ScopedWrite
 	}
 	if len(c.Clients) == 0 {
 		return errors.New("config: at least one client is required")
@@ -143,7 +157,7 @@ func (c *Config) Normalize() error {
 				return fmt.Errorf("config: client %q: permission %q:%q must be a GitHub permission name with read, write or admin", cl.Name, k, v)
 			}
 		}
-		if len(cl.Perms) > 0 && c.Write.App == nil {
+		if len(cl.Perms) > 0 && scoped.App == nil {
 			return fmt.Errorf("config: client %q has perms, which only an App write credential can honour", cl.Name)
 		}
 	}

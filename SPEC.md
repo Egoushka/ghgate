@@ -127,7 +127,7 @@ credentials and already mints GitHub App installation tokens (`app` credential).
 way a consumer gets GitHub access.
 
 **Design.**
-- `write` is an `app` credential (a write-capable App; `read` stays the read-only `ghgate-reader`). An installation
+- `scoped_write` is an `app` credential (a write-capable App) used by clients that carry `repos` or `perms`; `write` may stay a PAT for clients that need user-scoped endpoints; `read` stays the read-only `ghgate-reader`. Without `scoped_write`, limited clients use `write`. An installation
   token lasts 1 h and is minted by ghgate; nobody rotates anything.
 - Each client may carry `repos` (`owner/name`, or `owner/*`) and `perms` (GitHub permission name to
   `read|write|admin`):
@@ -156,6 +156,7 @@ way a consumer gets GitHub access.
 | AC13 | A limited client's write mints an installation token with `repositories` and `permissions` from its config; an unlimited client's mint has no narrowing. |
 | AC14 | A limited client gets 403, with 0 upstream requests, for other repositories, GraphQL, `/user`, dot-segment paths and git on another repository; `owner/*` and `/rate_limit` pass. |
 | AC15 | `POST /v1/token` needs a limited can_write client; narrows to the request; refuses repos or permissions above the scope. |
+| AC17 | With `scoped_write`, a limited client writes with the App and an unlimited one with `write`. |
 | AC16 | Config rejects a bad repo, permission name or level, and `perms` without an App write credential. |
 
 ## Not in v0

@@ -60,6 +60,7 @@ type Server struct {
 	floor      *floor.Tracker
 	read       creds.Source
 	write      creds.Source
+	scopedW    creds.Source // for limited clients; the write source when scoped_write is unset
 	sameCred   bool
 	hc         *http.Client
 	log        *slog.Logger
@@ -147,6 +148,12 @@ func New(cfg *config.Config, opt Options) (*Server, error) {
 	}
 	if s.write, err = mk(cfg.Write); err != nil {
 		return nil, err
+	}
+	s.scopedW = s.write
+	if cfg.ScopedWrite != nil {
+		if s.scopedW, err = mk(cfg.ScopedWrite); err != nil {
+			return nil, err
+		}
 	}
 	s.sameCred = credID(cfg.Read) == credID(cfg.Write)
 	if s.sameCred {
