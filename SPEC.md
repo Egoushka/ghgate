@@ -119,6 +119,45 @@ Scope the proxy to GitHub traffic only, so nothing else goes through it:
 - `git`: `http.https://github.com/.proxy` and `http.https://github.com/.sslCAInfo`.
 - github-mcp: the same environment on its container.
 
+## Broker mode (v0.2): one credential store, no hand-made tokens
+
+**Why:** a personal access token (PAT) expires, is tied to one human, and has one blast radius for every consumer.
+The website deploy token expiring on 2026-11-22 left hrabovskyi.online stale for 3 days. ghgate already holds the
+credentials and already mints GitHub App installation tokens (`app` credential). Broker mode makes that the only
+way a consumer gets GitHub access.
+
+**Design.**
+- `write` is an `app` credential (a write-capable App; `read` stays the read-only `ghgate-reader`). An installation
+  token lasts 1 h and is minted by ghgate; nobody rotates anything.
+- Each client may carry `repos` (`owner/name`, or `owner/*`) and `perms` (GitHub permission name to
+  `read|write|admin`):
+  - A limited client gets `403` for any request that names no allowed repository: other repositories, GraphQL,
+    `/user`, `/orgs/...`, dot-segment paths. `/rate_limit` is allowed. Nothing goes upstream.
+  - Its writes (API writes, git over HTTPS, the read retry with the write credential) use an installation token
+    narrowed at mint time to the client's repository names and `perms`, so GitHub enforces the ceiling too.
+    Narrowed tokens are cached per owner, repository set and permission set, and renewed 10 min before expiry.
+  - `perms` needs an `app` write credential (rejected at load otherwise): a PAT cannot be narrowed.
+- **Token vending**, for consumers that cannot use a proxy (a `git pull` job, a CI step):
+  `POST /v1/token` on the proxy listener, `Authorization: Bearer <client token>`, optional body
+  `{"repos":["owner/name"],"permissions":{"contents":"read"}}`. The answer is
+  `{"token","expires_at","owner","repositories","permissions"}` with `Cache-Control: no-store`.
+  The request may ask for less than the client's scope, never more; repos must be of one owner; the token has at
+  least 10 min of life left. Needs `can_write`, a `repos` list and an App write credential. An empty body means the
+  client's whole scope, which is refused (`400`) when it spans owners.
+- **The PAT survives only where an App cannot act**: user-scoped or cross-owner endpoints (`GET /user`, GraphQL
+  `viewer`, notifications), GHCR package pulls by a user, and GitHub Actions secrets the App is not installed for.
+  Those clients keep `can_write` without `repos`, and use `pat_env`.
+
+**Contract field.** The homelab service contract renders clients from
+`x-homelab.identity.github: {repos: [...], perms: {...}, write: bool}` (homelab `tools/render-ghgate.py`).
+
+| # | Check |
+|---|---|
+| AC13 | A limited client's write mints an installation token with `repositories` and `permissions` from its config; an unlimited client's mint has no narrowing. |
+| AC14 | A limited client gets 403, with 0 upstream requests, for other repositories, GraphQL, `/user`, dot-segment paths and git on another repository; `owner/*` and `/rate_limit` pass. |
+| AC15 | `POST /v1/token` needs a limited can_write client; narrows to the request; refuses repos or permissions above the scope. |
+| AC16 | Config rejects a bad repo, permission name or level, and `perms` without an App write credential. |
+
 ## Not in v0
 
 - A disk cache.

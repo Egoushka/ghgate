@@ -15,6 +15,12 @@ type Client struct {
 	Name        string `json:"name"`
 	TokenSHA256 string `json:"token_sha256"`
 	CanWrite    bool   `json:"can_write"`
+	// Repos limits the client to these repositories ("owner/name", or "owner/*" for every repository of an
+	// owner). Empty means no limit. A limited client gets 403 for anything that does not name an allowed repository.
+	Repos []string `json:"repos,omitempty"`
+	// Perms narrows the installation tokens minted for this client's writes and for /v1/token
+	// (GitHub permission name -> read|write|admin). Only an App write credential can honour it.
+	Perms map[string]string `json:"perms,omitempty"`
 }
 
 type App struct {
@@ -120,14 +126,34 @@ func (c *Config) Normalize() error {
 	if len(c.Clients) == 0 {
 		return errors.New("config: at least one client is required")
 	}
-	for _, cl := range c.Clients {
+	for i, cl := range c.Clients {
 		b, err := hex.DecodeString(cl.TokenSHA256)
 		if cl.Name == "" || err != nil || len(b) != 32 {
 			return fmt.Errorf("config: client %q needs a name and a 64-hex token_sha256", cl.Name)
 		}
+		for j, r := range cl.Repos {
+			r = strings.ToLower(strings.TrimSpace(r))
+			if !repoPat.MatchString(r) {
+				return fmt.Errorf("config: client %q: repo %q must be owner/name or owner/*", cl.Name, r)
+			}
+			c.Clients[i].Repos[j] = r
+		}
+		for k, v := range cl.Perms {
+			if !permName.MatchString(k) || (v != "read" && v != "write" && v != "admin") {
+				return fmt.Errorf("config: client %q: permission %q:%q must be a GitHub permission name with read, write or admin", cl.Name, k, v)
+			}
+		}
+		if len(cl.Perms) > 0 && c.Write.App == nil {
+			return fmt.Errorf("config: client %q has perms, which only an App write credential can honour", cl.Name)
+		}
 	}
 	return nil
 }
+
+var (
+	repoPat  = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*/([a-z0-9._-]+|\*)$`)
+	permName = regexp.MustCompile(`^[a-z_]+$`)
+)
 
 var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 

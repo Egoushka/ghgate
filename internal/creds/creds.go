@@ -20,6 +20,13 @@ type Source interface {
 	Token(ctx context.Context, owner string) (token, label string, err error)
 }
 
+// ScopedSource is a Source that can narrow a token to repositories (names within owner) and permissions.
+// Only GitHub App installation tokens can be narrowed.
+type ScopedSource interface {
+	Source
+	TokenScoped(ctx context.Context, owner string, repos []string, perms map[string]string) (token, label string, expires time.Time, err error)
+}
+
 // PAT reads a personal access token from a file and re-reads it when the file changes.
 type PAT struct {
 	path string

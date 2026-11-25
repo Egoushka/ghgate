@@ -1,6 +1,8 @@
 package creds
 
 import (
+	"bytes"
+	"io"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -200,13 +202,24 @@ func (a *App) find(owner string) *installation {
 }
 
 func (a *App) call(ctx context.Context, method, path, jwt string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, method, a.apiBase+path, nil)
+	return a.callBody(ctx, method, path, jwt, nil, out)
+}
+
+func (a *App) callBody(ctx context.Context, method, path, jwt string, body []byte, out any) error {
+	var rd io.Reader
+	if body != nil {
+		rd = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, a.apiBase+path, rd)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+jwt)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "ghgate")
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
 	resp, err := a.hc.Do(req)
 	if err != nil {
 		return errors.New("creds: app request failed")
@@ -303,4 +316,85 @@ func (a *App) jwt() (string, error) {
 		return "", err
 	}
 	return msg + "." + enc.EncodeToString(sig), nil
+}
+
+// scopeKey names one narrowed token: owner, sorted repository names and sorted permissions.
+func scopeKey(owner string, repos []string, perms map[string]string) string {
+	r := append([]string(nil), repos...)
+	sort.Strings(r)
+	ks := make([]string, 0, len(perms))
+	for k, v := range perms {
+		ks = append(ks, k+"="+v)
+	}
+	sort.Strings(ks)
+	return "scoped|" + strings.ToLower(owner) + "|" + strings.Join(r, ",") + "|" + strings.Join(ks, ",")
+}
+
+// TokenScoped returns an installation token for owner limited to repos (names, without the owner; empty means
+// every repository of the installation) and to perms (empty means the App's own permissions). A token is reused
+// until 10 minutes before it expires, so the caller always gets at least 10 minutes of life.
+func (a *App) TokenScoped(ctx context.Context, owner string, repos []string, perms map[string]string) (string, string, time.Time, error) {
+	owner = strings.ToLower(owner)
+	if len(repos) == 0 && len(perms) == 0 {
+		tok, label, err := a.Token(ctx, owner)
+		a.mu.Lock()
+		exp := a.toks[owner].expires
+		a.mu.Unlock()
+		return tok, label, exp, err
+	}
+	key := scopeKey(owner, repos, perms)
+	if tok, exp, ok := a.cachedKey(key); ok {
+		return tok, a.label(owner), exp, nil
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	type res struct {
+		tok string
+		exp time.Time
+		err error
+	}
+	v, _ := a.flights.Do(key, func() any {
+		inst, err := a.findInstallation(ctx, owner)
+		if err != nil {
+			return res{err: err}
+		}
+		jwt, err := a.jwt()
+		if err != nil {
+			return res{err: err}
+		}
+		req := map[string]any{}
+		if len(repos) > 0 {
+			req["repositories"] = repos
+		}
+		if len(perms) > 0 {
+			req["permissions"] = perms
+		}
+		body, _ := json.Marshal(req)
+		var out struct {
+			Token     string    `json:"token"`
+			ExpiresAt time.Time `json:"expires_at"`
+		}
+		if err := a.callBody(ctx, http.MethodPost, fmt.Sprintf("/app/installations/%d/access_tokens", inst.id), jwt, body, &out); err != nil {
+			return res{err: err}
+		}
+		if out.Token == "" {
+			return res{err: errors.New("creds: empty installation token")}
+		}
+		a.mu.Lock()
+		a.toks[key] = cachedTok{out.Token, out.ExpiresAt}
+		a.mu.Unlock()
+		return res{tok: out.Token, exp: out.ExpiresAt}
+	})
+	r := v.(res)
+	return r.tok, a.label(owner), r.exp, r.err
+}
+
+func (a *App) cachedKey(key string) (string, time.Time, bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	t, ok := a.toks[key]
+	if ok && a.now().Before(t.expires.Add(-renewBefore)) {
+		return t.tok, t.expires, true
+	}
+	return "", time.Time{}, false
 }
