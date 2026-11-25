@@ -49,6 +49,7 @@ type client struct {
 	name     string
 	hash     [32]byte
 	canWrite bool
+	scope    *scope
 }
 
 type Server struct {
@@ -155,7 +156,7 @@ func New(cfg *config.Config, opt Options) (*Server, error) {
 	}
 	for _, c := range cfg.Clients {
 		b, _ := hex.DecodeString(c.TokenSHA256)
-		cl := client{name: c.Name, canWrite: c.CanWrite}
+		cl := client{name: c.Name, canWrite: c.CanWrite, scope: newScope(c)}
 		copy(cl.hash[:], b)
 		s.clients = append(s.clients, cl)
 	}
@@ -184,6 +185,10 @@ func (s *Server) CA() *ca.Set { return s.ca }
 
 // ServeHTTP accepts CONNECT; plain proxy requests are refused.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodConnect && r.URL.Path == "/v1/token" && r.URL.Host == "" {
+		s.handleVend(w, r)
+		return
+	}
 	if r.Method != http.MethodConnect {
 		http.Error(w, "ghgate is a CONNECT-only proxy", http.StatusMethodNotAllowed)
 		return

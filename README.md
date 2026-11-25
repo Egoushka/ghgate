@@ -76,6 +76,12 @@ you set it. Otherwise only clients with `can_write` get it, read with the `write
 anything goes upstream. GraphQL answers a repository the installation cannot see with `200` and partial data, not a 404, so the
 write-credential retry does not cover it.
 
+**Broker mode.** With an `app` write credential, a client may carry `repos` (`owner/name` or `owner/*`) and `perms`
+(`{"contents":"write"}`): it is refused anything outside those repositories, and its writes use an installation token
+narrowed to them at mint time. Consumers that cannot use a proxy (a `git pull` job) fetch a one-hour token with
+`curl -s -X POST -H "Authorization: Bearer $CLIENT_TOKEN" -d '{"repos":["o/r"],"permissions":{"contents":"read"}}' http://ghgate:8899/v1/token`.
+No PAT is needed anywhere an App can act. See SPEC.md, "Broker mode".
+
 **Read-only clients and git.** A client without `can_write` gets git upload-pack on `github.com` and nothing else there:
 no LFS batch, no archive or raw downloads, no web pages. Give such a client `can_write`, or use the API, for those.
 

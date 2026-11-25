@@ -73,6 +73,11 @@ func (s *Server) handle(w http.ResponseWriter, r *http.Request, host string, t t
 	}
 	rc.client = cl.name
 	r.Header.Del("Authorization")
+	if !s.inScope(cl, t.api, r) {
+		s.refuse(sw, rc, http.StatusForbidden, "ghgate: this client token is limited to its allowed repositories, and this request names none of them")
+		rc.outcome = "bypass"
+		return
+	}
 	if t.api {
 		s.handleAPI(sw, r, cl, t, rc)
 	} else {
@@ -90,6 +95,7 @@ type apiReq struct {
 	hdr               http.Header
 	body              []byte
 	owner, resource   string
+	cl                *client
 	cacheable         bool
 	bodyHash          string
 }
@@ -149,7 +155,7 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 		return
 	}
 	in := &apiReq{method: r.Method, base: t.base, uri: r.URL.RequestURI(), hdr: apiHeaders(r.Header), body: body,
-		owner: owner, resource: resource, cacheable: r.Method == http.MethodGet}
+		cl: cl, owner: owner, resource: resource, cacheable: r.Method == http.MethodGet}
 	if gql {
 		sum := sha256.Sum256(body)
 		in.bodyHash = hex.EncodeToString(sum[:])
@@ -168,6 +174,9 @@ func (s *Server) handleAPI(w *statusWriter, r *http.Request, cl *client, t targe
 		first = hWrite
 	}
 	fk := in.key(first) + "|retry=" + strconv.FormatBool(retry)
+	if retry && cl.scope != nil {
+		fk += "|client=" + cl.name
+	}
 	v, shared := s.flights.Do(fk, func() any { return s.fetchRead(ctx, in, retry, first) })
 	res := v.(*result)
 	if shared && res.overflow && res.err == nil {
@@ -221,6 +230,9 @@ func (s *Server) upstream(ctx context.Context, in *apiReq, kind string, floorN i
 		src = s.write
 	}
 	tok, label, err := src.Token(ctx, in.owner)
+	if kind == hWrite {
+		tok, label, err = s.writeToken(ctx, in.cl, in.owner)
+	}
 	if errors.Is(err, creds.ErrNoInstallation) && kind == hRead {
 		return &result{status: http.StatusNotFound, header: http.Header{"Content-Type": {"application/json"}},
 			body: []byte(`{"message":"Not Found"}`), outcome: "bypass"}
@@ -383,7 +395,7 @@ func (s *Server) handleWrite(w *statusWriter, r *http.Request, cl *client, t tar
 		return
 	}
 	ctx := r.Context()
-	tok, label, err := s.write.Token(ctx, s.ownerFor(r.URL.Path))
+	tok, label, err := s.writeToken(ctx, cl, s.ownerFor(r.URL.Path))
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"message": "ghgate: write credential unavailable"})
 		return
@@ -456,7 +468,7 @@ func (s *Server) handleWeb(w *statusWriter, r *http.Request, cl *client, t targe
 		return
 	}
 	seg := strings.SplitN(strings.TrimPrefix(p, "/"), "/", 2)[0]
-	tok, _, err := s.write.Token(r.Context(), seg)
+	tok, _, err := s.writeToken(r.Context(), cl, seg)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{"message": "ghgate: write credential unavailable"})
 		return
