@@ -38,6 +38,8 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		err = serve(os.Args[2:])
+	case "app-register":
+		err = appRegister(os.Args[2:])
 	case "ca":
 		err = printCA(os.Args[2:])
 	case "healthcheck":
