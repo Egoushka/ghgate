@@ -301,3 +301,30 @@ func TestAppWithEnvKeySignsAndPATFromEnvIsReadOnce(t *testing.T) {
 		t.Fatalf("unset PAT env: %v", err)
 	}
 }
+
+func TestInspectReportsPermissionsAndRepositoriesWithoutTheToken(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	keyFile := filepath.Join(t.TempDir(), "app.pem")
+	os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600)
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/app/installations":
+			fmt.Fprint(w, `[{"id":5,"account":{"login":"nytka-app"}}]`)
+		case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			fmt.Fprintf(w, `{"token":"secret-tok","repository_selection":"selected","permissions":{"issues":"read","metadata":"read"},"expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		case r.URL.Path == "/installation/repositories" && r.Header.Get("Authorization") == "Bearer secret-tok":
+			fmt.Fprint(w, `{"repositories":[{"full_name":"nytka-app/server"},{"full_name":"nytka-app/android"}]}`)
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+	defer srv.Close()
+	got, err := NewApp(1, keyFile, srv.URL, srv.Client()).Inspect(context.Background(), "NYTKA-APP")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, _ := json.Marshal(got)
+	if got.Permissions["issues"] != "read" || len(got.Repos) != 2 || got.Selection != "selected" || strings.Contains(string(b), "secret-tok") {
+		t.Fatalf("unexpected inspection %s", b)
+	}
+}

@@ -166,3 +166,7 @@ way a consumer gets GitHub access.
 - Webhook-fed state, so that waiting costs 0 calls.
 - An MCP endpoint with compact, agent-shaped answers.
 - A dashboard.
+
+### Inspecting an installation (admin port)
+
+`GET /installations/{read|write|scoped_write}/{owner}` on the admin port answers `{owner, repository_selection, permissions, repositories}` for the App behind that credential: use it to check an owner's installation covers the repositories and permissions a client needs. It mints a fresh token and never returns it; `404` when the credential is a PAT or the owner has no installation. Test: `TestInspectReportsPermissionsAndRepositoriesWithoutTheToken`.
