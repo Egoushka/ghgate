@@ -192,3 +192,35 @@ func TestAC16_ConfigRejectsBadScope(t *testing.T) {
 		t.Errorf("good scope: %v %v", err, c.Clients[0].Repos)
 	}
 }
+
+func TestAC17_ScopedWriteAppServesLimitedClientsAndPATTheRest(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 2048)
+	keyFile := filepath.Join(t.TempDir(), "app.pem")
+	os.WriteFile(keyFile, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}), 0o600)
+	h := newHarness(t, func(c *config.Config) {
+		c.ScopedWrite = &config.Cred{App: &config.App{ID: 77, KeyFile: keyFile}}
+		c.Clients = append(c.Clients, config.Client{Name: "scoped", TokenSHA256: hashOf(t, clientScoped), CanWrite: true,
+			Repos: []string{"acme/site"}, Perms: map[string]string{"contents": "write"}})
+	})
+	h.api.fn = func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/app/installations":
+			io.WriteString(w, `[{"id":11,"account":{"login":"acme"}}]`)
+		case strings.HasSuffix(r.URL.Path, "/access_tokens"):
+			fmt.Fprintf(w, `{"token":"inst-app","expires_at":%q}`, time.Now().Add(time.Hour).UTC().Format(time.RFC3339))
+		default:
+			io.WriteString(w, `{}`)
+		}
+	}
+	h.do(h.client(), clientScoped, "POST", "https://api.github.com/repos/acme/site/issues", `{}`)
+	h.do(h.client(), clientWrite, "POST", "https://api.github.com/repos/acme/site/issues", `{}`)
+	var auths []string
+	for _, r := range h.api.all() {
+		if r.Method == "POST" && strings.HasSuffix(r.Path, "/issues") {
+			auths = append(auths, r.Auth)
+		}
+	}
+	if len(auths) != 2 || auths[0] != "Bearer inst-app" || auths[1] != "Bearer "+patWrite {
+		t.Fatalf("auths %v", auths)
+	}
+}

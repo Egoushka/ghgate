@@ -106,9 +106,12 @@ func (s *Server) inScope(cl *client, api bool, r *http.Request) bool {
 // writeToken is the write credential's token for cl: narrowed to the client's repositories and permissions when
 // the credential is an App, the plain token otherwise.
 func (s *Server) writeToken(ctx context.Context, cl *client, owner string) (tok, label string, err error) {
-	if ss, ok := s.write.(creds.ScopedSource); ok && cl != nil && cl.scope != nil {
-		tok, label, _, err = ss.TokenScoped(ctx, owner, cl.scope.names(owner), cl.scope.perms)
-		return
+	if cl != nil && cl.scope != nil {
+		if ss, ok := s.scopedW.(creds.ScopedSource); ok {
+			tok, label, _, err = ss.TokenScoped(ctx, owner, cl.scope.names(owner), cl.scope.perms)
+			return
+		}
+		return s.scopedW.Token(ctx, owner)
 	}
 	return s.write.Token(ctx, owner)
 }
@@ -140,7 +143,7 @@ func (s *Server) handleVend(w http.ResponseWriter, r *http.Request) {
 		s.refuse(sw, rc, http.StatusMethodNotAllowed, "ghgate: POST /v1/token")
 		return
 	}
-	ss, isApp := s.write.(creds.ScopedSource)
+	ss, isApp := s.scopedW.(creds.ScopedSource)
 	if !cl.canWrite || !cl.scope.limited() || !isApp {
 		s.refuse(sw, rc, http.StatusForbidden, "ghgate: token vending needs a client with can_write and a repos allowlist, and an App write credential")
 		return
